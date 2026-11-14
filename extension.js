@@ -12,6 +12,8 @@
 //   un programma nuovo aperto dal menu diventa la finestra attiva
 //   Super+Shift+G / overlook-toggle --all -> anche le finestre ridotte a icona:
 //                       all'uscita tornano ridotte (tranne quella scelta)
+//   Super+Tab        -> (in griglia) distribuisci le miniature su tutti i monitor
+//                       / ognuna sul suo monitor reale
 
 const { Clutter, St, Meta, GLib } = imports.gi;
 const Main = imports.ui.main;
@@ -27,6 +29,9 @@ const RESIZE_TOLERANCE = 24;    // px: i terminali arrotondano alla griglia dei 
 const SETTLE_MS = 450;          // attesa dopo maximize/resize prima di zoomare
 const TERMINAL_PORTRAIT = 0.7;  // larghezza = altezza * 0.7 per i terminali
 const TERMINAL_RE = /terminal|term$|^xterm|konsole|kitty|alacritty|tilix|terminator|wezterm|^foot|urxvt|ghostty|org\.gnome\.console/i;
+
+const SPREAD_GAIN = 1.4;         // una miniatura cambia monitor solo se diventa almeno 1,4 volte più grande
+const TOAST_MS = 1100;
 
 const MAX_BOTH = Meta.MaximizeFlags.BOTH;
 
@@ -156,6 +161,76 @@ function subtractRect(rects, h) {
     return out;
 }
 
+// ---------- distribuzione sui monitor ----------
+// Partenza: ogni finestra sul suo monitor. Poi, una alla volta, sposta la
+// finestra che migliora di più il totale (somma dei log delle aree: premia le
+// miniature piccole che crescono), ma solo se la sua miniatura diventa almeno
+// SPREAD_GAIN volte più grande. Tornare sul proprio monitor non ha soglia.
+
+function thumbAreas(items, area) {
+    const out = new Map();
+    if (!items.length) return out;
+    const tmp = items.map(it => ({ src: it, aspect: it.aspect }));
+    computeLayout(tmp, area);
+    const maxScale = items.length === 1 ? MAX_SCALE : 1;
+    for (const t of tmp) {
+        const it = t.src;
+        const s = Math.min(maxScale, t.rect.w / it.fw, t.rect.h / it.fh);
+        out.set(it, s * s * it.fw * it.fh);
+    }
+    return out;
+}
+
+function distribute(items, monitors) {
+    const assign = new Map();
+    const valid = new Set(monitors);
+    for (const it of items) assign.set(it, valid.has(it.home) ? it.home : monitors[0]);
+    if (monitors.length < 2 || items.length < 2) return assign;
+
+    const cache = new Map();
+    const listOf = m => items.filter(it => assign.get(it) === m);
+    const areasOf = (m, list) => {
+        const key = `${m}:${list.map(it => it.id).join(',')}`;
+        if (!cache.has(key)) cache.set(key, thumbAreas(list, workArea(m)));
+        return cache.get(key);
+    };
+    const logSum = map => [...map.values()].reduce((s, a) => s + Math.log(Math.max(a, 1)), 0);
+
+    for (let iter = 0; iter < items.length * 2; iter++) {
+        let best = null, bestDelta = 1e-3;
+        for (const it of items) {
+            const from = assign.get(it);
+            const srcOld = listOf(from), srcNew = srcOld.filter(x => x !== it);
+            const oldSrcAreas = areasOf(from, srcOld);
+            for (const to of monitors) {
+                if (to === from) continue;
+                const dstOld = listOf(to);
+                const dstNew = [...dstOld, it].sort((a, b) => a.id - b.id);
+                const newDst = areasOf(to, dstNew);
+                if (to !== it.home &&
+                    Math.sqrt(newDst.get(it) / oldSrcAreas.get(it)) < SPREAD_GAIN) continue;
+                const delta = logSum(areasOf(from, srcNew)) + logSum(newDst)
+                    - logSum(oldSrcAreas) - logSum(areasOf(to, dstOld));
+                if (delta > bestDelta) { bestDelta = delta; best = [it, to]; }
+            }
+        }
+        if (!best) break;
+        assign.set(best[0], best[1]);
+    }
+    return assign;
+}
+
+// Freccia che indica dove si trova davvero la finestra.
+function arrowTo(fromMon, toMon) {
+    const ms = Main.layoutManager.monitors;
+    const a = ms[fromMon], b = ms[toMon];
+    if (!a || !b) return '⇄';
+    const dx = (b.x + b.width / 2) - (a.x + a.width / 2);
+    const dy = (b.y + b.height / 2) - (a.y + a.height / 2);
+    if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? '→' : '←';
+    return dy > 0 ? '↓' : '↑';
+}
+
 class ZoomGrid {
     constructor(meta) {
         this.meta = meta;
@@ -181,6 +256,8 @@ class ZoomGrid {
         this.userMax = new Map();    // stato di massimizzazione impostato da noi
         this.freeSignals = new Map(); // finestre seguite per la regione di input
         this.regionId = 0;
+        this.spread = true;          // distribuisci le miniature su tutti i monitor
+        this.toast = null;
     }
 
     enable() {
@@ -248,6 +325,7 @@ class ZoomGrid {
         this.showAll = all;
         this.wasMinimized = new Set();
         if (all) this._restoreMinimized();
+        Main.keybindingManager.addHotKey('zoomgrid-spread', '<Super>Tab', () => this.toggleSpread());
         this._buildOverlays();
         this._queueRelayout(SETTLE_MS, true); // normalizza, aspetta, poi zooma
     }
@@ -305,6 +383,8 @@ class ZoomGrid {
         this.activeWin = null;
         this._cancelClick();
         if (this.relayoutId) { GLib.source_remove(this.relayoutId); this.relayoutId = 0; }
+        Main.keybindingManager.removeHotKey('zoomgrid-spread');
+        this._hideToast();
         this._destroyOverlays();
         this._disconnectWindows();
         const reMin = [...(this.wasMinimized || [])]
@@ -335,6 +415,40 @@ class ZoomGrid {
             w.activate(global.get_current_time());
         }
         this._relayout();
+    }
+
+    // Super+Tab in griglia: distribuite su tutti i monitor <-> ognuna sul suo.
+    toggleSpread() {
+        if (!this.active) return;
+        this.spread = !this.spread;
+        this._relayout();
+        this._showToast(this.spread ? 'Miniature distribuite su tutti i monitor'
+                                    : 'Miniature sul loro monitor');
+    }
+
+    _showToast(text) {
+        this._hideToast();
+        const mon = Main.layoutManager.primaryMonitor;
+        const label = new St.Label({ style_class: 'zoomgrid-toast', text });
+        Main.layoutManager.addChrome(label, { affectsInputRegion: false, visibleInFullscreen: true });
+        const [, nw] = label.get_preferred_width(-1);
+        const [, nh] = label.get_preferred_height(-1);
+        label.set_position(Math.round(mon.x + (mon.width - nw) / 2), Math.round(mon.y + (mon.height - nh) / 2));
+        this.toast = label;
+        this.toastId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, TOAST_MS, () => {
+            this.toastId = 0;
+            this._hideToast();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _hideToast() {
+        if (this.toastId) { GLib.source_remove(this.toastId); this.toastId = 0; }
+        if (this.toast) {
+            Main.layoutManager.removeChrome(this.toast);
+            this.toast.destroy();
+            this.toast = null;
+        }
     }
 
     _windows() {
@@ -390,13 +504,22 @@ class ZoomGrid {
         this._trackWindows(wins);
         this._buildOverlays();
 
-        const byMon = new Map();
+        const items = [];
         for (const w of wins) {
-            const m = w.get_monitor();
-            if (!byMon.has(m)) byMon.set(m, []);
             const f = w.get_frame_rect();
             if (f.width < 1 || f.height < 1) continue;
-            byMon.get(m).push({ win: w, aspect: f.width / f.height, term: isTerminal(w) });
+            items.push({
+                win: w, id: w.get_stable_sequence(), home: w.get_monitor(),
+                fw: f.width, fh: f.height, aspect: f.width / f.height, term: isTerminal(w),
+            });
+        }
+        const monitors = Main.layoutManager.monitors.map(mon => mon.index);
+        const assign = this.spread ? distribute(items, monitors) : null;
+        const byMon = new Map();
+        for (const it of items) {
+            const m = assign ? assign.get(it) : it.home;
+            if (!byMon.has(m)) byMon.set(m, []);
+            byMon.get(m).push(it);
         }
         for (const [m, items] of byMon) {
             if (!items.length) continue;
@@ -405,7 +528,9 @@ class ZoomGrid {
             const gridItems = items, gridArea = area, margin = MARGIN;
             if (overlay) this._addBlockers(overlay, area, null);
 
-            const terms = gridItems.filter(it => it.term);
+            // proporzione dei terminali: solo per quelli che stanno sul loro
+            // monitor (il ridimensionamento è vero, avviene sul monitor reale)
+            const terms = gridItems.filter(it => it.term && it.home === m);
             if (terms.length && gridItems.length > 1) {
                 // proporzione dei terminali che riempie meglio lo spazio
                 let bestR = null, bestS = -1;
@@ -429,7 +554,8 @@ class ZoomGrid {
             if (gridItems.length) {
                 computeLayout(gridItems, gridArea, margin);
                 const maxScale = gridItems.length === 1 ? MAX_SCALE : 1;
-                for (const it of gridItems) this._place(it, overlay, area, maxScale);
+                for (const it of gridItems)
+                    this._place(it, overlay, area, maxScale, it.home !== m ? arrowTo(m, it.home) : null);
             }
         }
         // gli angoli attivi di Cinnamon devono restare sopra gli overlay
@@ -498,7 +624,8 @@ class ZoomGrid {
         upd();
     }
 
-    _place(it, overlay, area, maxScale) {
+    // away = freccia verso il monitor reale, se la miniatura è su un altro monitor
+    _place(it, overlay, area, maxScale, away = null) {
         const w = it.win, actor = w.get_compositor_private();
         if (!actor) return;
         const f = w.get_frame_rect(), b = w.get_buffer_rect();
@@ -527,6 +654,7 @@ class ZoomGrid {
             width: Math.round(fw) + 6, height: Math.round(fh) + 6,
         });
         if (this.selected.includes(w)) tile.add_style_class_name('zoomgrid-selected');
+        if (away) tile.add_style_class_name('zoomgrid-away');
         const focused = w === this.activeWin;
         if (focused) tile.add_style_class_name('zoomgrid-focused');
         // mappa: punto sullo schermo -> punto nella finestra vera
@@ -601,6 +729,12 @@ class ZoomGrid {
         }
         overlay.add_child(tile);
         Main.layoutManager.trackChrome(tile, { affectsInputRegion: true });
+        if (away) {
+            overlay.add_child(new St.Label({
+                style_class: 'zoomgrid-away-badge', text: away, reactive: false,
+                x: Math.round(X - area.x) + 6, y: Math.round(Y - area.y) + 6,
+            }));
+        }
         if (focused && this._fsButton) {
             overlay.add_child(this._fsButton);
             Main.layoutManager.trackChrome(this._fsButton, { affectsInputRegion: true });
