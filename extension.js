@@ -30,6 +30,7 @@ const SETTLE_MS = 450;          // attesa dopo maximize/resize prima di zoomare
 const TERMINAL_PORTRAIT = 0.7;  // larghezza = altezza * 0.7 per i terminali
 const TERMINAL_RE = /terminal|term$|^xterm|konsole|kitty|alacritty|tilix|terminator|wezterm|^foot|urxvt|ghostty|org\.gnome\.console/i;
 
+const SPREAD_MIN = 3;           // un monitor presta miniature agli altri solo se ha almeno 3 finestre
 const SPREAD_GAIN = 1.4;         // una miniatura cambia monitor solo se diventa almeno 1,4 volte più grande
 const TOAST_MS = 1100;
 
@@ -165,7 +166,8 @@ function subtractRect(rects, h) {
 // Partenza: ogni finestra sul suo monitor. Poi, una alla volta, sposta la
 // finestra che migliora di più il totale (somma dei log delle aree: premia le
 // miniature piccole che crescono), ma solo se la sua miniatura diventa almeno
-// SPREAD_GAIN volte più grande. Tornare sul proprio monitor non ha soglia.
+// SPREAD_GAIN volte più grande. Un monitor con meno di SPREAD_MIN finestre
+// se le tiene. Tornare sul proprio monitor non ha soglia.
 
 function thumbAreas(items, area) {
     const out = new Map();
@@ -185,7 +187,10 @@ function distribute(items, monitors) {
     const assign = new Map();
     const valid = new Set(monitors);
     for (const it of items) assign.set(it, valid.has(it.home) ? it.home : monitors[0]);
-    if (monitors.length < 2 || items.length < 2) return assign;
+    if (monitors.length < 2 || items.length < SPREAD_MIN) return assign;
+    const homeCount = new Map();
+    for (const it of items) homeCount.set(assign.get(it), (homeCount.get(assign.get(it)) || 0) + 1);
+    const canLeave = it => (homeCount.get(it.home) || 0) >= SPREAD_MIN;
 
     const cache = new Map();
     const listOf = m => items.filter(it => assign.get(it) === m);
@@ -199,6 +204,7 @@ function distribute(items, monitors) {
     for (let iter = 0; iter < items.length * 2; iter++) {
         let best = null, bestDelta = 1e-3;
         for (const it of items) {
+            if (!canLeave(it)) continue;
             const from = assign.get(it);
             const srcOld = listOf(from), srcNew = srcOld.filter(x => x !== it);
             const oldSrcAreas = areasOf(from, srcOld);

@@ -4,7 +4,7 @@ A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live
 
 - Landscape windows are maximized and zoomed out; terminals are kept in **portrait** orientation.
 - The layout is justified per monitor (rows or columns, whichever fits best).
-- With several monitors, thumbnails are **spread across all of them** when one monitor is crowded: a window moves to another monitor only if its thumbnail gets at least 1.4× bigger (tall windows such as terminals prefer a portrait monitor). Moved thumbnails have an orange border and an arrow pointing to the monitor where the window really is. Clicking still works on the real window, which stays where it was.
+- With several monitors, thumbnails are **spread across all of them** when one monitor is crowded (3 or more windows): a window moves to another monitor only if its thumbnail gets at least 1.4× bigger (tall windows such as terminals prefer a portrait monitor). Moved thumbnails have an orange border and an arrow pointing to the monitor where the window really is. Clicking still works on the real window, which stays where it was.
 
 ## Usage
 
