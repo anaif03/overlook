@@ -31,7 +31,6 @@ const TERMINAL_PORTRAIT = 0.7;  // larghezza = altezza * 0.7 per i terminali
 const TERMINAL_RE = /terminal|term$|^xterm|konsole|kitty|alacritty|tilix|terminator|wezterm|^foot|urxvt|ghostty|org\.gnome\.console/i;
 
 const SPREAD_MIN = 3;           // un monitor presta miniature agli altri solo se ha almeno 3 finestre
-const SPREAD_GAIN = 1.4;         // una miniatura cambia monitor solo se diventa almeno 1,4 volte più grande
 const TOAST_MS = 1100;
 
 const MAX_BOTH = Meta.MaximizeFlags.BOTH;
@@ -163,11 +162,12 @@ function subtractRect(rects, h) {
 }
 
 // ---------- distribuzione sui monitor ----------
-// Partenza: ogni finestra sul suo monitor. Poi, una alla volta, sposta la
-// finestra che migliora di più il totale (somma dei log delle aree: premia le
-// miniature piccole che crescono), ma solo se la sua miniatura diventa almeno
-// SPREAD_GAIN volte più grande. Un monitor con meno di SPREAD_MIN finestre
-// se le tiene. Tornare sul proprio monitor non ha soglia.
+// A numero: finché un monitor ha almeno 2 miniature più di un altro, ne
+// sposta una. Partono solo le finestre di un monitor che ne ha almeno
+// SPREAD_MIN (con 1-2 finestre un monitor se le tiene). Tra le mosse
+// possibili sceglie quella con le miniature più grandi (somma dei log delle
+// aree), poi scambia coppie se conviene: così i terminali vanno di
+// preferenza sul monitor verticale.
 
 function thumbAreas(items, area) {
     const out = new Map();
@@ -201,27 +201,47 @@ function distribute(items, monitors) {
     };
     const logSum = map => [...map.values()].reduce((s, a) => s + Math.log(Math.max(a, 1)), 0);
 
-    for (let iter = 0; iter < items.length * 2; iter++) {
-        let best = null, bestDelta = 1e-3;
+    for (let iter = 0; iter < items.length; iter++) {
+        let best = null, bestDelta = -Infinity;
         for (const it of items) {
             if (!canLeave(it)) continue;
             const from = assign.get(it);
             const srcOld = listOf(from), srcNew = srcOld.filter(x => x !== it);
-            const oldSrcAreas = areasOf(from, srcOld);
             for (const to of monitors) {
                 if (to === from) continue;
                 const dstOld = listOf(to);
+                if (srcOld.length - dstOld.length < 2) continue;   // già bilanciati
                 const dstNew = [...dstOld, it].sort((a, b) => a.id - b.id);
-                const newDst = areasOf(to, dstNew);
-                if (to !== it.home &&
-                    Math.sqrt(newDst.get(it) / oldSrcAreas.get(it)) < SPREAD_GAIN) continue;
-                const delta = logSum(areasOf(from, srcNew)) + logSum(newDst)
-                    - logSum(oldSrcAreas) - logSum(areasOf(to, dstOld));
+                const delta = logSum(areasOf(from, srcNew)) + logSum(areasOf(to, dstNew))
+                    - logSum(areasOf(from, srcOld)) - logSum(areasOf(to, dstOld));
                 if (delta > bestDelta) { bestDelta = delta; best = [it, to]; }
             }
         }
         if (!best) break;
         assign.set(best[0], best[1]);
+    }
+
+    // rifinitura: scambia coppie tra monitor se le miniature crescono
+    // (es. terminale sul verticale, browser sull'orizzontale)
+    const allowed = (it, m) => m === it.home || canLeave(it);
+    for (let iter = 0; iter < items.length; iter++) {
+        let best = null, bestDelta = 1e-3;
+        for (let i = 0; i < items.length; i++) {
+            for (let j = i + 1; j < items.length; j++) {
+                const a = items[i], b = items[j];
+                const ma = assign.get(a), mb = assign.get(b);
+                if (ma === mb || !allowed(a, mb) || !allowed(b, ma)) continue;
+                const la = listOf(ma), lb = listOf(mb);
+                const na = la.map(x => x === a ? b : x).sort((x, y) => x.id - y.id);
+                const nb = lb.map(x => x === b ? a : x).sort((x, y) => x.id - y.id);
+                const delta = logSum(areasOf(ma, na)) + logSum(areasOf(mb, nb))
+                    - logSum(areasOf(ma, la)) - logSum(areasOf(mb, lb));
+                if (delta > bestDelta) { bestDelta = delta; best = [a, b, ma, mb]; }
+            }
+        }
+        if (!best) break;
+        assign.set(best[0], best[3]);
+        assign.set(best[1], best[2]);
     }
     return assign;
 }
