@@ -13,7 +13,7 @@ A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live
 | Double-click a thumbnail, or the ⛶ button | Show that window full screen |
 | Ctrl+click two thumbnails | Put them side by side |
 | Click an empty area | Deselect |
-| Bottom-right hot corner (primary monitor) | Enter the grid / deselect |
+| Hot corner (you choose which, see below) | Enter the grid / deselect |
 | `Super+G` | Toggle grid ↔ full screen |
 
 New windows join the grid automatically. Minimized windows are left out.
@@ -25,6 +25,16 @@ git clone https://github.com/anaif03/overlook.git ~/.local/share/cinnamon/extens
 ```
 
 Then enable **Overlook** in *System Settings → Extensions* (or log out and back in first if it does not appear).
+
+### Hot corner
+
+Open *System Settings → Hot Corners*, enable the corner you like, choose **Custom command** and enter:
+
+```
+~/.local/share/cinnamon/extensions/overlook@anaif03/overlook-toggle
+```
+
+(use the full path, e.g. `/home/<you>/.local/share/...`, if `~` is not expanded).
 
 Tested on Linux Mint 22.3, Cinnamon 6.6, X11.
 

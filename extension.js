@@ -166,8 +166,7 @@ class ZoomGrid {
         this.ignoreFocusUntil = 0;
         this.ignoreMaxUntil = 0;
         this.termRatio = new Map();  // monitor -> proporzione scelta per i terminali
-        this.corner = null;
-        this.pointer = null;         // dispositivo virtuale per inoltrare i click
+                this.pointer = null;         // dispositivo virtuale per inoltrare i click
         this.pendingScroll = [];
         this.scrollFlushId = 0;
         this.fwdQueue = [];
@@ -188,7 +187,6 @@ class ZoomGrid {
         };
         Main.layoutManager._chrome.updateRegions();
         Main.keybindingManager.addHotKey('zoomgrid-toggle', '<Super>g', () => this.toggle());
-        this._makeHotCorner();
         // Programma nuovo aperto (es. dal menu) mentre si è in miniature:
         // diventa la finestra attiva. Dialoghi e popup vengono ignorati.
         this._connect(global.display, 'window-created', (_d, w) => {
@@ -207,7 +205,6 @@ class ZoomGrid {
         this._connect(global.workspace_manager, 'active-workspace-changed', () => this.exit(null));
         this._connect(global.display, 'notify::focus-window', () => this._onFocus());
         this._connect(Main.layoutManager, 'monitors-changed', () => {
-            this._makeHotCorner();
             if (this.active) this._queueRelayout(SETTLE_MS, false);
         });
     }
@@ -221,11 +218,6 @@ class ZoomGrid {
         Main.keybindingManager.removeHotKey('zoomgrid-toggle');
         for (const [obj, id] of this.signals) obj.disconnect(id);
         this.signals = [];
-        if (this.corner) {
-            Main.layoutManager.removeChrome(this.corner);
-            this.corner.destroy();
-            this.corner = null;
-        }
     }
 
     toggle() {
@@ -371,9 +363,8 @@ class ZoomGrid {
                 for (const it of gridItems) this._place(it, overlay, area, maxScale);
             }
         }
-        // l'angolo attivo deve restare sopra gli overlay
-        if (this.corner && this.corner.get_parent())
-            this.corner.get_parent().set_child_above_sibling(this.corner, null);
+        // gli angoli attivi di Cinnamon devono restare sopra gli overlay
+        this._raiseHotCorners();
     }
 
     _place(it, overlay, area, maxScale) {
@@ -743,25 +734,23 @@ class ZoomGrid {
         this.ignoreFocusUntil = Math.max(this.ignoreFocusUntil, Date.now() + ms);
     }
 
-    // ---------- hot corner in basso a destra (monitor principale) ----------
-    // fuori dalle miniature: entra; con una finestra attiva: tutte miniature
+    // ---------- angolo attivo ----------
+    // Overlook non crea un suo angolo: si assegna il comando
+    // overlook-toggle a un angolo in Impostazioni -> Angoli attivi.
+    // Fuori dalla griglia: entra; con una finestra selezionata: deseleziona.
 
-    _makeHotCorner() {
-        if (this.corner) {
-            Main.layoutManager.removeChrome(this.corner);
-            this.corner.destroy();
+    cornerAction() {
+        if (!this.active) this.enter();
+        else if (this.activeWin) this.setActive(null);
+    }
+
+    _raiseHotCorners() {
+        const mgr = Main.layoutManager.hotCornerManager;
+        if (!mgr || !mgr.corners) return;
+        for (const k in mgr.corners) {
+            const a = mgr.corners[k] && mgr.corners[k].actor;
+            if (a && a.get_parent()) a.get_parent().set_child_above_sibling(a, null);
         }
-        const m = Main.layoutManager.primaryMonitor;
-        this.corner = new St.Widget({
-            reactive: true, track_hover: true,
-            x: m.x + m.width - 3, y: m.y + m.height - 3, width: 3, height: 3,
-        });
-        this.corner.connect('enter-event', () => {
-            if (!this.active) this.enter();
-            else if (this.activeWin) this.setActive(null);
-            return Clutter.EVENT_PROPAGATE;
-        });
-        Main.layoutManager.addChrome(this.corner, { affectsInputRegion: true, visibleInFullscreen: true });
     }
 
     _connect(obj, sig, cb) {
@@ -777,10 +766,10 @@ function init(meta) {
 
 function enable() {
     zoomGrid.enable();
-    global.zoomGrid = zoomGrid; // per debug da Looking Glass
+    global.overlook = zoomGrid; // usato da overlook-toggle
 }
 
 function disable() {
     zoomGrid.disable();
-    delete global.zoomGrid;
+    delete global.overlook;
 }

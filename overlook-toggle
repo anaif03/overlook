@@ -1,0 +1,5 @@
+#!/bin/sh
+# Overlook: azione per un angolo attivo di Cinnamon (comando personalizzato).
+# Entra nella griglia, oppure deseleziona la finestra se sei già nella griglia.
+exec gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
+  --method org.Cinnamon.Eval 'global.overlook && global.overlook.cornerAction()' >/dev/null
