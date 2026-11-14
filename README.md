@@ -36,6 +36,11 @@ Open *System Settings → Hot Corners*, enable the corner you like, choose **Cus
 
 (use the full path, e.g. `/home/<you>/.local/share/...`, if `~` is not expanded).
 
+For a second corner that also brings minimized windows into the grid, use
+`overlook-toggle --all` (keyboard: Super+Shift+G). On exit they are minimized
+again, except the one you picked. While in the grid, the other corner (or key)
+switches between the two modes.
+
 Tested on Linux Mint 22.3, Cinnamon 6.6, X11.
 
 ## Known limitations

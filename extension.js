@@ -10,6 +10,8 @@
 //   click su spazio vuoto / angolo -> torna a tutte miniature
 //   Super+G          -> esce dalla griglia (la finestra attiva va a schermo intero)
 //   un programma nuovo aperto dal menu diventa la finestra attiva
+//   Super+Shift+G / overlook-toggle --all -> anche le finestre ridotte a icona:
+//                       all'uscita tornano ridotte (tranne quella scelta)
 
 const { Clutter, St, Meta, GLib } = imports.gi;
 const Main = imports.ui.main;
@@ -134,16 +136,19 @@ function computeLayout(items, area, margin = MARGIN) {
     return bestScore;
 }
 
-// Toglie il pixel (px,py) da una lista di rettangoli (regione di input).
-function punchHole(rects, px, py) {
+// Toglie il rettangolo h da una lista di rettangoli (regione di input).
+function subtractRect(rects, h) {
     const out = [];
+    const hx2 = h.x + h.width, hy2 = h.y + h.height;
     for (const r of rects) {
-        if (px < r.x || px >= r.x + r.width || py < r.y || py >= r.y + r.height) { out.push(r); continue; }
+        const rx2 = r.x + r.width, ry2 = r.y + r.height;
+        if (hx2 <= r.x || h.x >= rx2 || hy2 <= r.y || h.y >= ry2) { out.push(r); continue; }
+        const top = Math.max(r.y, h.y), bot = Math.min(ry2, hy2);
         const parts = [
-            [r.x, r.y, r.width, py - r.y],                              // sopra
-            [r.x, py + 1, r.width, r.y + r.height - py - 1],            // sotto
-            [r.x, py, px - r.x, 1],                                     // sinistra
-            [px + 1, py, r.x + r.width - px - 1, 1],                    // destra
+            [r.x, r.y, r.width, h.y - r.y],                 // sopra
+            [r.x, hy2, r.width, ry2 - hy2],                 // sotto
+            [r.x, top, h.x - r.x, bot - top],               // sinistra
+            [hx2, top, rx2 - hx2, bot - top],               // destra
         ];
         for (const [x, y, width, height] of parts)
             if (width > 0 && height > 0) out.push(new Meta.Rectangle({ x, y, width, height }));
@@ -174,6 +179,8 @@ class ZoomGrid {
         this.fwdReal = null;
         this.home = null;
         this.userMax = new Map();    // stato di massimizzazione impostato da noi
+        this.freeSignals = new Map(); // finestre seguite per la regione di input
+        this.regionId = 0;
     }
 
     enable() {
@@ -183,14 +190,16 @@ class ZoomGrid {
         this.inputRects = [];
         global.set_stage_input_region = (rects) => {
             this.inputRects = rects;
-            this._origSetRegion.call(global, rects);
+            this._applyRegion();
         };
         Main.layoutManager._chrome.updateRegions();
-        Main.keybindingManager.addHotKey('zoomgrid-toggle', '<Super>g', () => this.toggle());
+        Main.keybindingManager.addHotKey('zoomgrid-toggle', '<Super>g', () => this.toggle(false));
+        Main.keybindingManager.addHotKey('zoomgrid-toggle-all', '<Super><Shift>g', () => this.toggle(true));
         // Programma nuovo aperto (es. dal menu) mentre si è in miniature:
         // diventa la finestra attiva. Dialoghi e popup vengono ignorati.
         this._connect(global.display, 'window-created', (_d, w) => {
             if (!this.active) return;
+            this._trackFree(w);
             this._ignoreFocus(1500);
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
                 if (this.active && w.get_window_type() === Meta.WindowType.NORMAL &&
@@ -216,26 +225,81 @@ class ZoomGrid {
             Main.layoutManager._chrome.updateRegions();
         }
         Main.keybindingManager.removeHotKey('zoomgrid-toggle');
+        Main.keybindingManager.removeHotKey('zoomgrid-toggle-all');
         for (const [obj, id] of this.signals) obj.disconnect(id);
         this.signals = [];
     }
 
-    toggle() {
-        if (this.active) this.exit(this.activeWin); else this.enter();
+    // all = true: anche le finestre ridotte a icona.
+    // Stesso tasto in griglia -> esce; l'altro tasto -> cambia modalità.
+    toggle(all) {
+        if (!this.active) this.enter(all);
+        else if (all !== this.showAll) this.setMode(all);
+        else this.exit(this.activeWin);
     }
 
     // ---------- modalità miniature ----------
 
-    enter() {
+    enter(all = false) {
         if (this.active) return;
         this.active = true;
         this.activeWin = null;
         this.selected = [];
+        this.showAll = all;
+        this.wasMinimized = new Set();
+        if (all) this._restoreMinimized();
         this._buildOverlays();
         this._queueRelayout(SETTLE_MS, true); // normalizza, aspetta, poi zooma
     }
 
-    exit(focusWin) {
+    // Cambia modalità restando in griglia: aggiunge o toglie le finestre
+    // che erano ridotte a icona.
+    setMode(all) {
+        if (!this.active || all === this.showAll) return;
+        this.showAll = all;
+        if (all) {
+            this._restoreMinimized();
+            this._queueRelayout(SETTLE_MS, true);
+        } else {
+            // la finestra selezionata resta aperta anche se era ridotta
+            const list = [...this.wasMinimized].filter(w => w !== this.activeWin);
+            this.wasMinimized = new Set();
+            this._reMinimize(list);
+            this._queueRelayout(SETTLE_MS, false);
+        }
+    }
+
+    // Riapre le finestre ridotte a icona del workspace e se le segna:
+    // all'uscita tornano ridotte (tranne quella scelta).
+    _restoreMinimized() {
+        const ws = global.workspace_manager.get_active_workspace();
+        for (const a of global.get_window_actors()) {
+            const w = a.get_meta_window();
+            if (w && w.minimized && w.get_window_type() === Meta.WindowType.NORMAL &&
+                !w.is_skip_taskbar() && !w.get_transient_for() &&
+                (w.get_workspace() === ws || w.is_on_all_workspaces()))
+            {
+                this.wasMinimized.add(w);
+                w.unminimize();
+            }
+        }
+    }
+
+    // Riduce a icona subito, senza animazione di ritorno dalla miniatura.
+    _reMinimize(list) {
+        for (const w of list) {
+            const actor = w.get_compositor_private();
+            if (!actor) continue;
+            actor.remove_all_transitions();
+            actor.set_scale(1, 1);
+            actor.set_translation(0, 0, 0);
+            this.scaled.delete(w);
+            try { w.minimize(); } catch (e) { global.logError(`zoomgrid: ${e}`); }
+        }
+    }
+
+    // keep = finestre da lasciare aperte anche se erano ridotte a icona
+    exit(focusWin, keep = []) {
         if (!this.active) return;
         this.active = false;
         this.activeWin = null;
@@ -243,9 +307,14 @@ class ZoomGrid {
         if (this.relayoutId) { GLib.source_remove(this.relayoutId); this.relayoutId = 0; }
         this._destroyOverlays();
         this._disconnectWindows();
+        const reMin = [...(this.wasMinimized || [])]
+            .filter(w => w !== focusWin && !keep.includes(w));
+        this.wasMinimized = new Set();
+        this._reMinimize(reMin);
         for (const w of this.scaled) this._resetActor(w);
         this.scaled.clear();
         this.selected = [];
+        this._applyRegion();
         if (focusWin) {
             this._ignoreFocus(500);
             if (focusWin.get_maximized() !== MAX_BOTH && focusWin.can_maximize())
@@ -365,6 +434,68 @@ class ZoomGrid {
         }
         // gli angoli attivi di Cinnamon devono restare sopra gli overlay
         this._raiseHotCorners();
+        for (const a of global.get_window_actors()) this._trackFree(a.get_meta_window());
+        this._applyRegion();
+    }
+
+    // ---------- finestre libere ----------
+    // Dialoghi, menu, popup: non stanno in griglia e restano a grandezza vera
+    // sopra le miniature. La loro area va tolta dalla regione di input,
+    // altrimenti i click finiscono sulle miniature sotto e il dialogo resta
+    // intoccabile (e, se modale, blocca anche la sua finestra).
+
+    _freeRects() {
+        if (!this.active) return [];
+        const ws = global.workspace_manager.get_active_workspace();
+        const T = Meta.WindowType;
+        const out = [];
+        for (const a of global.get_window_actors()) {
+            const w = a.get_meta_window();
+            if (!w || this.scaled.has(w) || w.minimized || !a.visible) continue;
+            const t = w.get_window_type();
+            if (t === T.DESKTOP || t === T.DOCK) continue;
+            if (!w.is_override_redirect() && w.get_workspace() !== ws && !w.is_on_all_workspaces()) continue;
+            const f = w.get_frame_rect();
+            if (f.width > 0 && f.height > 0) out.push(f);
+        }
+        return out;
+    }
+
+    // Applica la regione di input di Cinnamon meno le finestre libere
+    // (e meno un eventuale buco per l'inoltro dei click).
+    _applyRegion(hole = null) {
+        if (!this._origSetRegion) return;
+        let rects = this.inputRects || [];
+        for (const f of this._freeRects()) rects = subtractRect(rects, f);
+        if (hole) rects = subtractRect(rects, hole);
+        this._origSetRegion.call(global, rects);
+    }
+
+    _queueApplyRegion() {
+        if (this.regionId) return;
+        this.regionId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
+            this.regionId = 0;
+            if (!this.fwdRunning) this._applyRegion();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Segue comparsa/spostamento/chiusura di ogni finestra per aggiornare
+    // la regione di input.
+    _trackFree(w) {
+        if (!w || this.freeSignals.has(w)) return;
+        const upd = () => this._queueApplyRegion();
+        const ids = [
+            w.connect('position-changed', upd),
+            w.connect('size-changed', upd),
+            w.connect('notify::minimized', upd),
+            w.connect('unmanaged', () => {
+                this.freeSignals.delete(w);
+                upd();
+            }),
+        ];
+        this.freeSignals.set(w, ids);
+        upd();
     }
 
     _place(it, overlay, area, maxScale) {
@@ -514,7 +645,7 @@ class ZoomGrid {
         this.fwdBusyUntil = Date.now() + 1000;
         this.fwdReal = [rx, ry];
         this.home = [sx, sy];
-        this._origSetRegion.call(global, punchHole(this.inputRects, rx, ry));
+        this._applyRegion({ x: rx, y: ry, width: 1, height: 1 });
 
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, FWD_DELAY_MS, () => {
             const t = global.get_current_time() * 1000;  // microsecondi
@@ -529,7 +660,7 @@ class ZoomGrid {
                 this.pointer.notify_discrete_scroll(t, d, Clutter.ScrollSource.WHEEL);
             this.pointer.notify_absolute_motion(t, sx, sy);
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
-                this._origSetRegion.call(global, this.inputRects);
+                this._applyRegion();
                 this.fwdBusyUntil = Date.now() + 60;
                 this._runForward();
                 return GLib.SOURCE_REMOVE;
@@ -589,7 +720,7 @@ class ZoomGrid {
     }
 
     _split(a, b) {
-        this.exit(null);
+        this.exit(null, [a, b]);
         this._ignoreFocus(800);
         const mon = a.get_monitor();
         const wa = workArea(mon);
@@ -702,6 +833,7 @@ class ZoomGrid {
                     this._ignoreFocus(800);
                     this.scaled.delete(w);
                     this.winSignals.delete(w);
+                    if (this.wasMinimized) this.wasMinimized.delete(w);
                     if (this.activeWin === w) this.activeWin = null;
                     relayout();
                 }),
@@ -711,10 +843,13 @@ class ZoomGrid {
     }
 
     _disconnectWindows() {
-        for (const [w, ids] of this.winSignals) {
-            for (const id of ids) { try { w.disconnect(id); } catch (e) {} }
+        for (const map of [this.winSignals, this.freeSignals]) {
+            for (const [w, ids] of map) {
+                for (const id of ids) { try { w.disconnect(id); } catch (e) {} }
+            }
+            map.clear();
         }
-        this.winSignals.clear();
+        if (this.regionId) { GLib.source_remove(this.regionId); this.regionId = 0; }
     }
 
     // Finestra scelta da pannello / Alt+Tab mentre si è in miniature:
@@ -737,10 +872,14 @@ class ZoomGrid {
     // ---------- angolo attivo ----------
     // Overlook non crea un suo angolo: si assegna il comando
     // overlook-toggle a un angolo in Impostazioni -> Angoli attivi.
-    // Fuori dalla griglia: entra; con una finestra selezionata: deseleziona.
+    // overlook-toggle        -> solo finestre aperte
+    // overlook-toggle --all  -> anche quelle ridotte a icona
+    // Fuori dalla griglia: entra. In griglia: l'angolo dell'altra modalità
+    // cambia modalità; lo stesso angolo deseleziona la finestra selezionata.
 
-    cornerAction() {
-        if (!this.active) this.enter();
+    cornerAction(all = false) {
+        if (!this.active) this.enter(all);
+        else if (all !== this.showAll) this.setMode(all);
         else if (this.activeWin) this.setActive(null);
     }
 

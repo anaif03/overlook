@@ -1,5 +1,10 @@
 #!/bin/sh
 # Overlook: azione per un angolo attivo di Cinnamon (comando personalizzato).
-# Entra nella griglia, oppure deseleziona la finestra se sei già nella griglia.
+#   overlook-toggle        -> griglia con le sole finestre aperte
+#   overlook-toggle --all  -> griglia anche con le finestre ridotte a icona
+# In griglia: l'angolo dell'altra modalità cambia modalità, lo stesso angolo
+# deseleziona la finestra selezionata.
+ALL=false
+[ "$1" = "--all" ] && ALL=true
 exec gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
-  --method org.Cinnamon.Eval 'global.overlook && global.overlook.cornerAction()' >/dev/null
+  --method org.Cinnamon.Eval "global.overlook && global.overlook.cornerAction($ALL)" >/dev/null
