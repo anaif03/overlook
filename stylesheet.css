@@ -15,15 +15,27 @@
 .zoomgrid-tile.zoomgrid-focused {
   border-color: rgba(74, 163, 255, 0.9);
 }
-.zoomgrid-fs {
-  font-size: 16px;
-  color: white;
-  background-color: rgba(30, 30, 30, 0.85);
+.zoomgrid-bar {
+  background-color: rgba(30, 30, 30, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.4);
   border-radius: 6px;
-  padding: 2px 8px;
+  padding: 1px 2px;
+  spacing: 1px;
 }
-.zoomgrid-fs:hover { background-color: rgba(74, 163, 255, 0.9); }
+.zoomgrid-bar-btn {
+  font-size: 15px;
+  color: white;
+  border-radius: 4px;
+  padding: 1px 7px;
+}
+.zoomgrid-bar-btn:hover { background-color: rgba(74, 163, 255, 0.9); }
+.zoomgrid-bar-btn.zoomgrid-bar-close:hover { background-color: rgba(220, 60, 50, 0.95); }
+.zoomgrid-bar-weight {
+  font-size: 13px;
+  font-weight: bold;
+  color: #4aa3ff;
+  padding: 2px 2px 0 2px;
+}
 .zoomgrid-tile.zoomgrid-away {
   border-color: rgba(255, 190, 70, 0.55);
 }

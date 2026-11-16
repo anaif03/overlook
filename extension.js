@@ -32,6 +32,11 @@ const TERMINAL_RE = /terminal|term$|^xterm|konsole|kitty|alacritty|tilix|termina
 
 const SPREAD_MIN = 3;           // un monitor presta miniature agli altri solo se ha almeno 3 finestre
 const TOAST_MS = 1100;
+const WEIGHTS = [0.5, 1, 2, 3];  // importanza di una miniatura: − / + nella barra
+const BALANCE_EXP = 0.15;       // quanto conta avere miniature di grandezza giusta rispetto all'area totale
+const BALANCE_EXP_WEIGHTED = 0.5; // idem con pesi diversi: ×2 = lato doppio, ½ = lato a metà
+const WEIGHT_LABEL = { 0.5: '½', 2: '×2', 3: '×3' };
+const BAR_HIDE_MS = 80;         // ritardo prima di nascondere la barra (passaggio miniatura -> barra)
 
 const MAX_BOTH = Meta.MaximizeFlags.BOTH;
 
@@ -78,12 +83,26 @@ function partitions(arr) {
 
 // Righe giustificate in un'area W x H; restituisce rect relativi (0,0).
 // a(it) = aspect da usare (w/h). Le colonne si ottengono trasponendo.
-function justifiedRows(groups, W, H, a) {
-    let hs = groups.map(g => (W - GAP * (g.length - 1)) / g.reduce((s, it) => s + a(it), 0));
-    const sumH = hs.reduce((s, h) => s + h, 0);
-    const f = Math.min(1, (H - GAP * (groups.length - 1)) / sumH);
-    if (f <= 0) return null;
-    hs = hs.map(h => h * f);
+// weighted = false: righe ridotte tutte nella stessa misura se non entrano.
+// weighted = true: altezza delle righe in proporzione al peso (importanza)
+// delle loro miniature, senza superare l'altezza che riempie la larghezza.
+function justifiedRows(groups, W, H, a, weighted = false) {
+    const nat = groups.map(g => (W - GAP * (g.length - 1)) / g.reduce((s, it) => s + a(it), 0));
+    const avail = H - GAP * (groups.length - 1);
+    if (avail <= 0) return null;
+    // quota di altezza chiesta da ogni riga: naturale, oppure il peso medio
+    const want = weighted
+        ? groups.map(g => g.reduce((s, it) => s + (it.weight || 1), 0) / g.length)
+        : nat;
+    const hs = new Array(groups.length).fill(0);
+    let free = groups.map((_g, i) => i), left = avail;
+    while (free.length) {
+        const k = left / free.reduce((s, i) => s + want[i], 0);
+        const capped = free.filter(i => want[i] * k >= nat[i]);
+        if (!capped.length) { for (const i of free) hs[i] = want[i] * k; break; }
+        for (const i of capped) { hs[i] = nat[i]; left -= nat[i]; }
+        free = free.filter(i => !capped.includes(i));
+    }
     const totalH = hs.reduce((s, h) => s + h, 0) + GAP * (groups.length - 1);
     const rects = new Map();
     let y = (H - totalH) / 2;
@@ -100,11 +119,17 @@ function justifiedRows(groups, W, H, a) {
     return rects;
 }
 
-function scoreRects(rects) {
-    const areas = [...rects.values()].map(r => r.w * r.h);
-    const total = areas.reduce((s, x) => s + x, 0);
-    const balance = Math.min(...areas) / Math.max(...areas);
-    return total * Math.pow(balance, 0.15);   // leggera preferenza per miniature simili
+// Area coperta, pesata con l'importanza; leggera preferenza per miniature
+// simili, dove "simili" = lato proporzionale al peso (×2 = lato doppio).
+function scoreRects(rects, exp = BALANCE_EXP) {
+    let total = 0, lo = Infinity, hi = 0;
+    for (const [it, r] of rects) {
+        const wt = it.weight || 1, area = r.w * r.h, norm = area / (wt * wt);
+        total += area * wt;
+        lo = Math.min(lo, norm);
+        hi = Math.max(hi, norm);
+    }
+    return total * Math.pow(lo / hi, exp);
 }
 
 function computeLayout(items, area, margin = MARGIN) {
@@ -115,22 +140,30 @@ function computeLayout(items, area, margin = MARGIN) {
         [...items.filter(it => !isP(it)), ...items.filter(isP)],
         [...items.filter(isP), ...items.filter(it => !isP(it))],
     ];
+    // pesi diversi: anche le più importanti per prime (possono avere una
+    // riga/colonna tutta loro) e righe alte in proporzione al peso
+    const weighted = items.some(it => (it.weight || 1) !== 1);
+    if (weighted) orders.push([...items].sort((x, y) => (y.weight || 1) - (x.weight || 1)));
+    const modes = weighted ? [false, true] : [false];
+    const exp = weighted ? BALANCE_EXP_WEIGHTED : BALANCE_EXP;
     let best = null, bestScore = -1;
     for (const order of orders) {
         for (const groups of partitions(order)) {
-            // righe
-            const rows = justifiedRows(groups, W, H, it => it.aspect);
-            if (rows) {
-                const s = scoreRects(rows);
-                if (s > bestScore) { bestScore = s; best = rows; }
-            }
-            // colonne (trasposizione)
-            const colsT = justifiedRows(groups, H, W, it => 1 / it.aspect);
-            if (colsT) {
-                const cols = new Map();
-                for (const [it, r] of colsT) cols.set(it, { x: r.y, y: r.x, w: r.h, h: r.w });
-                const s = scoreRects(cols);
-                if (s > bestScore) { bestScore = s; best = cols; }
+            for (const wm of modes) {
+                // righe
+                const rows = justifiedRows(groups, W, H, it => it.aspect, wm);
+                if (rows) {
+                    const s = scoreRects(rows, exp);
+                    if (s > bestScore) { bestScore = s; best = rows; }
+                }
+                // colonne (trasposizione)
+                const colsT = justifiedRows(groups, H, W, it => 1 / it.aspect, wm);
+                if (colsT) {
+                    const cols = new Map();
+                    for (const [it, r] of colsT) cols.set(it, { x: r.y, y: r.x, w: r.h, h: r.w });
+                    const s = scoreRects(cols, exp);
+                    if (s > bestScore) { bestScore = s; best = cols; }
+                }
             }
         }
     }
@@ -172,7 +205,7 @@ function subtractRect(rects, h) {
 function thumbAreas(items, area) {
     const out = new Map();
     if (!items.length) return out;
-    const tmp = items.map(it => ({ src: it, aspect: it.aspect }));
+    const tmp = items.map(it => ({ src: it, aspect: it.aspect, weight: it.weight }));
     computeLayout(tmp, area);
     const maxScale = items.length === 1 ? MAX_SCALE : 1;
     for (const t of tmp) {
@@ -284,6 +317,9 @@ class ZoomGrid {
         this.regionId = 0;
         this.spread = true;          // distribuisci le miniature su tutti i monitor
         this.toast = null;
+        this.portrait = new Map();   // finestra -> verticale sì/no scelto con la barra
+        this.weight = new Map();     // finestra -> importanza scelta con − / +
+        this.prefSignals = new Map(); // 'unmanaged' per dimenticare le due scelte
     }
 
     enable() {
@@ -331,6 +367,10 @@ class ZoomGrid {
         Main.keybindingManager.removeHotKey('zoomgrid-toggle-all');
         for (const [obj, id] of this.signals) obj.disconnect(id);
         this.signals = [];
+        for (const [w, id] of this.prefSignals) { try { w.disconnect(id); } catch (e) {} }
+        this.prefSignals.clear();
+        this.portrait.clear();
+        this.weight.clear();
     }
 
     // all = true: anche le finestre ridotte a icona.
@@ -493,7 +533,7 @@ class ZoomGrid {
     _normalize(w) {
         if (w.is_fullscreen()) w.unmake_fullscreen();
         const wa = workArea(w.get_monitor());
-        if (isTerminal(w)) {
+        if (this._isPortrait(w)) {
             const h = wa.height, wd = Math.round(h * (this.termRatio.get(w.get_monitor()) || TERMINAL_PORTRAIT));
             if (w.get_maximized()) w.unmaximize(MAX_BOTH);
             const f = w.get_frame_rect();
@@ -503,6 +543,46 @@ class ZoomGrid {
             w.maximize(MAX_BOTH);
         }
         this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
+    }
+
+    // ---------- scelte per finestra (barra delle icone) ----------
+    // Valgono finché la finestra resta aperta, anche uscendo dalla griglia.
+
+    _isPortrait(w) {
+        return this.portrait.has(w) ? this.portrait.get(w) : isTerminal(w);
+    }
+
+    _weight(w) {
+        return this.weight.get(w) || 1;
+    }
+
+    _rememberWindow(w) {
+        if (this.prefSignals.has(w)) return;
+        this.prefSignals.set(w, w.connect('unmanaged', () => {
+            this.prefSignals.delete(w);
+            this.portrait.delete(w);
+            this.weight.delete(w);
+        }));
+    }
+
+    _toggleOrientation(w) {
+        this._rememberWindow(w);
+        this.portrait.set(w, !this._isPortrait(w));
+        try { this._normalize(w); } catch (e) { global.logError(`zoomgrid: ${e}`); }
+        this._queueRelayout(SETTLE_MS, false);
+    }
+
+    _changeWeight(w, step) {
+        const i = WEIGHTS.indexOf(this._weight(w));
+        const next = WEIGHTS[Math.max(0, Math.min(WEIGHTS.length - 1, i + step))];
+        if (next === this._weight(w)) return;
+        this._rememberWindow(w);
+        if (next === 1) this.weight.delete(w); else this.weight.set(w, next);
+        this._relayout();
+    }
+
+    _closeWindow(w) {
+        try { w.delete(global.get_current_time()); } catch (e) { global.logError(`zoomgrid: ${e}`); }
     }
 
     _queueRelayout(delay, normalize) {
@@ -536,7 +616,8 @@ class ZoomGrid {
             if (f.width < 1 || f.height < 1) continue;
             items.push({
                 win: w, id: w.get_stable_sequence(), home: w.get_monitor(),
-                fw: f.width, fh: f.height, aspect: f.width / f.height, term: isTerminal(w),
+                fw: f.width, fh: f.height, aspect: f.width / f.height,
+                term: this._isPortrait(w), weight: this._weight(w),
             });
         }
         const monitors = Main.layoutManager.monitors.map(mon => mon.index);
@@ -745,13 +826,6 @@ class ZoomGrid {
                 }
                 return Clutter.EVENT_STOP;
             });
-            // pulsante "schermo intero" nell'angolo della miniatura
-            const fsBtn = new St.Button({
-                style_class: 'zoomgrid-fs', label: '⛶', reactive: true,
-                x: Math.round(X - area.x + fw) - 40, y: Math.round(Y - area.y) - 18,
-            });
-            fsBtn.connect('button-press-event', () => { this.exit(w); return Clutter.EVENT_STOP; });
-            this._fsButton = fsBtn;
         }
         overlay.add_child(tile);
         Main.layoutManager.trackChrome(tile, { affectsInputRegion: true });
@@ -761,11 +835,57 @@ class ZoomGrid {
                 x: Math.round(X - area.x) + 6, y: Math.round(Y - area.y) + 6,
             }));
         }
-        if (focused && this._fsButton) {
-            overlay.add_child(this._fsButton);
-            Main.layoutManager.trackChrome(this._fsButton, { affectsInputRegion: true });
-            this._fsButton = null;
-        }
+        this._addBar(w, tile, overlay, Math.round(X - area.x + fw), Math.round(Y - area.y));
+    }
+
+    // Barra di icone a cavallo del bordo alto, a destra; compare passando
+    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ⛶ schermo intero.
+    // (sulla finestra selezionata copre i suoi pulsanti, che la barra rifà)
+    _addBar(w, tile, overlay, right, top) {
+        const bar = new St.BoxLayout({ style_class: 'zoomgrid-bar', reactive: true, track_hover: true });
+        const add = (label, cls, action) => {
+            const b = new St.Button({ style_class: `zoomgrid-bar-btn ${cls}`, label, reactive: true });
+            b.connect('button-press-event', (_a, event) => {
+                if (this._isEcho(event)) return Clutter.EVENT_STOP;
+                if (event.get_button() === 1) action();
+                return Clutter.EVENT_STOP;
+            });
+            b.connect('button-release-event', () => Clutter.EVENT_STOP);
+            bar.add_child(b);
+        };
+        const wt = this._weight(w);
+        add('✕', 'zoomgrid-bar-close', () => this._closeWindow(w));
+        add(this._isPortrait(w) ? '▭' : '▯', '', () => this._toggleOrientation(w));
+        add('−', '', () => this._changeWeight(w, -1));
+        if (WEIGHT_LABEL[wt]) bar.add_child(new St.Label({ style_class: 'zoomgrid-bar-weight', text: WEIGHT_LABEL[wt] }));
+        add('+', '', () => this._changeWeight(w, +1));
+        add('⛶', '', () => this.exit(w));
+        overlay.add_child(bar);
+        const [, bw] = bar.get_preferred_width(-1);
+        const [, bh] = bar.get_preferred_height(-1);
+        bar.set_position(right - Math.round(bw) - 8, top - Math.round(bh / 2));
+        bar.hide();
+        Main.layoutManager.trackChrome(bar, { affectsInputRegion: true });
+
+        // passando dalla miniatura alla barra l'hover cambia per un istante:
+        // si decide dopo un attimo
+        let timer = 0;
+        const sync = () => {
+            if (timer) GLib.source_remove(timer);
+            timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, BAR_HIDE_MS, () => {
+                timer = 0;
+                if (tile.hover || bar.hover) bar.show(); else bar.hide();
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+        tile.connect('notify::hover', sync);
+        bar.connect('notify::hover', sync);
+        bar.connect('destroy', () => { if (timer) GLib.source_remove(timer); timer = 0; });
+        // dopo − / + la griglia si ricostruisce sotto il puntatore fermo
+        const [px, py] = global.get_pointer();
+        const [ox, oy] = overlay.get_position();
+        const inside = (a, w2, h2) => px >= ox + a.x && px < ox + a.x + w2 && py >= oy + a.y && py < oy + a.y + h2;
+        if (inside(tile, tile.width, tile.height) || inside(bar, bw, bh)) bar.show();
     }
 
     // Inoltra click/rotellina alla finestra vera: per un istante toglie la
@@ -981,7 +1101,7 @@ class ZoomGrid {
                     // titolo, Super+Su...) -> schermo intero, esce dalle miniature
                     // (doppio click sulla barra del titolo inoltrato, Super+Su, ...)
                     if (this.active && w === this.activeWin && Date.now() > this.ignoreMaxUntil &&
-                        w.get_maximized() !== (isTerminal(w) ? 0 : MAX_BOTH)) {
+                        w.get_maximized() !== (this._isPortrait(w) ? 0 : MAX_BOTH)) {
                         this.exit(w);
                         return;
                     }

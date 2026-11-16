@@ -2,7 +2,7 @@
 
 A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live, scaled-down thumbnail** in a grid, and you can keep working inside the thumbnails.
 
-- Landscape windows are maximized and zoomed out; terminals are kept in **portrait** orientation.
+- Landscape windows are maximized and zoomed out; terminals are kept in **portrait** orientation (any window can be switched with ▯ / ▭; the choice lasts until the window is closed).
 - The layout is justified per monitor (rows or columns, whichever fits best).
 - With several monitors, thumbnails are **spread across all of them**: when a monitor has 3 or more windows, they are shared out until no monitor has 2 more than another (tall windows such as terminals prefer a portrait monitor). A monitor with 1–2 windows keeps them. Moved thumbnails have an orange border and an arrow pointing to the monitor where the window really is. Clicking still works on the real window, which stays where it was.
 
@@ -12,6 +12,7 @@ A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live
 |---|---|
 | Click a thumbnail | Select it (blue border) – keyboard goes to it, clicks and scrolls are forwarded into the window |
 | Double-click a thumbnail, or the ⛶ button | Show that window full screen |
+| Hover a thumbnail | Shows a small bar on its top edge: **✕** close · **▯ / ▭** portrait ↔ landscape · **− / +** less / more important (½, 1, ×2, ×3: the grid gives important windows more space) · **⛶** full screen |
 | Ctrl+click two thumbnails | Put them side by side |
 | Click an empty area | Deselect |
 | Hot corner (you choose which, see below) | Enter the grid / deselect |
