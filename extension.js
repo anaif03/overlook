@@ -8,7 +8,7 @@
 //   pulsante ⛶ / doppio click sul titolo -> schermo intero
 //   Ctrl+click x2    -> le due finestre selezionate affiancate a metà schermo
 //   click su spazio vuoto / angolo -> torna a tutte miniature
-//   Super+G          -> esce dalla griglia (la finestra attiva va a schermo intero)
+//   Super+G          -> esce dalla griglia (la finestra attiva resta della sua grandezza)
 //   un programma nuovo aperto dal menu diventa la finestra attiva
 //   Super+Shift+G / overlook-toggle --all -> anche le finestre ridotte a icona:
 //                       all'uscita tornano ridotte (tranne quella scelta)
@@ -36,6 +36,8 @@ const WEIGHTS = [0.5, 1, 2, 3];  // importanza di una miniatura: − / + nella b
 const BALANCE_EXP = 0.15;       // quanto conta avere miniature di grandezza giusta rispetto all'area totale
 const BALANCE_EXP_WEIGHTED = 0.5; // idem con pesi diversi: ×2 = lato doppio, ½ = lato a metà
 const WEIGHT_LABEL = { 0.5: '½', 2: '×2', 3: '×3' };
+const WIDTH_STEP = 0.1;         // ◂▸ / ▸◂ nella barra: allarga/stringe la finestra vera del 10% della larghezza di partenza
+const MIN_WIDTH = 200;          // px: ▸◂ non stringe sotto questa larghezza
 const BAR_HIDE_MS = 80;         // ritardo prima di nascondere la barra (passaggio miniatura -> barra)
 
 const MAX_BOTH = Meta.MaximizeFlags.BOTH;
@@ -319,6 +321,11 @@ class ZoomGrid {
         this.toast = null;
         this.portrait = new Map();   // finestra -> verticale sì/no scelto con la barra
         this.weight = new Map();     // finestra -> importanza scelta con − / +
+        this.landscapeGeom = new Map(); // finestra -> grandezza prima di passare a ▯
+        this.widthStep = new Map();  // finestra -> passo di ◂▸ / ▸◂ in px
+        this.widthBase = new Map();  // finestra -> larghezza prima del primo ◂▸ / ▸◂
+        this.widthExtra = new Map(); // finestra verticale -> px in più/meno rispetto alla larghezza scelta dalla griglia
+        this.baseMax = new Map();    // finestra -> massimizzata sì/no in griglia (per capire se l'utente la massimizza)
         this.prefSignals = new Map(); // 'unmanaged' per dimenticare le due scelte
     }
 
@@ -371,6 +378,11 @@ class ZoomGrid {
         this.prefSignals.clear();
         this.portrait.clear();
         this.weight.clear();
+        this.landscapeGeom.clear();
+        this.baseMax.clear();
+        this.widthStep.clear();
+        this.widthExtra.clear();
+        this.widthBase.clear();
     }
 
     // all = true: anche le finestre ridotte a icona.
@@ -378,7 +390,7 @@ class ZoomGrid {
     toggle(all) {
         if (!this.active) this.enter(all);
         else if (all !== this.showAll) this.setMode(all);
-        else this.exit(this.activeWin);
+        else this.exit(this.activeWin, [], false);
     }
 
     // ---------- modalità miniature ----------
@@ -390,6 +402,7 @@ class ZoomGrid {
         this.selected = [];
         this.showAll = all;
         this.wasMinimized = new Set();
+        this.baseMax = new Map();
         if (all) this._restoreMinimized();
         Main.keybindingManager.addHotKey('zoomgrid-spread', '<Super>Tab', () => this.toggleSpread());
         this._buildOverlays();
@@ -443,7 +456,8 @@ class ZoomGrid {
     }
 
     // keep = finestre da lasciare aperte anche se erano ridotte a icona
-    exit(focusWin, keep = []) {
+    // maximize = false: la finestra scelta resta della sua grandezza
+    exit(focusWin, keep = [], maximize = true) {
         if (!this.active) return;
         this.active = false;
         this.activeWin = null;
@@ -463,7 +477,7 @@ class ZoomGrid {
         this._applyRegion();
         if (focusWin) {
             this._ignoreFocus(500);
-            if (focusWin.get_maximized() !== MAX_BOTH && focusWin.can_maximize())
+            if (maximize && focusWin.get_maximized() !== MAX_BOTH && focusWin.can_maximize())
                 focusWin.maximize(MAX_BOTH);
             Main.activateWindow(focusWin);
         }
@@ -528,19 +542,35 @@ class ZoomGrid {
             .sort((a, b) => a.get_stable_sequence() - b.get_stable_sequence());
     }
 
-    // Forma "miniatura": finestre normali massimizzate (orizzontali, si vede la
-    // pagina intera), terminali in verticale.
+    // Forma "miniatura": le finestre orizzontali restano come sono (mai più
+    // grandi di come le ha lasciate l'utente), i terminali in verticale.
     _normalize(w) {
         if (w.is_fullscreen()) w.unmake_fullscreen();
         const wa = workArea(w.get_monitor());
         if (this._isPortrait(w)) {
-            const h = wa.height, wd = Math.round(h * (this.termRatio.get(w.get_monitor()) || TERMINAL_PORTRAIT));
+            this.baseMax.set(w, 0);
+            const h = wa.height;
+            const wd = Math.max(MIN_WIDTH, Math.min(wa.width,
+                Math.round(h * (this.termRatio.get(w.get_monitor()) || TERMINAL_PORTRAIT)) + (this.widthExtra.get(w) || 0)));
             if (w.get_maximized()) w.unmaximize(MAX_BOTH);
             const f = w.get_frame_rect();
             if (Math.abs(f.width - wd) > RESIZE_TOLERANCE || Math.abs(f.height - h) > RESIZE_TOLERANCE)
                 w.move_resize_frame(true, wa.x + Math.round((wa.width - wd) / 2), wa.y, wd, h);
-        } else if (w.get_maximized() !== MAX_BOTH && w.can_maximize()) {
-            w.maximize(MAX_BOTH);
+        } else {
+            // tornata orizzontale da ▯: riprende la grandezza che aveva prima
+            const g = this.landscapeGeom.get(w);
+            this.landscapeGeom.delete(w);
+            if (g && g.max === MAX_BOTH) {
+                if (w.get_maximized() !== MAX_BOTH && w.can_maximize()) w.maximize(MAX_BOTH);
+            } else if (g) {
+                if (w.get_maximized()) w.unmaximize(MAX_BOTH);
+                w.move_resize_frame(true, g.rect.x, g.rect.y, g.rect.width, g.rect.height);
+            } else if (this.portrait.get(w) === false && isTerminal(w) &&
+                       w.get_maximized() !== MAX_BOTH && w.can_maximize()) {
+                // terminale messo orizzontale a mano: non ha una grandezza da riprendere
+                w.maximize(MAX_BOTH);
+            }
+            this.baseMax.set(w, w.get_maximized() === MAX_BOTH ? MAX_BOTH : 0);
         }
         this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
     }
@@ -556,17 +586,43 @@ class ZoomGrid {
         return this.weight.get(w) || 1;
     }
 
+    // Allargata con ◂▸ la miniatura deve restare alta uguale: più area in
+    // proporzione alla larghezza (il peso conta sul lato, quindi radice).
+    // Nei terminali verticali conta solo lo scarto dato a mano, non la
+    // larghezza scelta dalla griglia (altrimenti si rincorrono).
+    _widthBoost(w, f) {
+        let k;
+        if (this._isPortrait(w)) {
+            const extra = this.widthExtra.get(w) || 0;
+            const auto = f.width - extra;
+            if (!extra || auto <= 0) return 1;
+            k = Math.sqrt(f.width / auto);
+        } else {
+            const base = this.widthBase.get(w);
+            if (!base) return 1;
+            k = Math.sqrt(f.width / base);
+        }
+        return Math.abs(k - 1) < 0.02 ? 1 : k;
+    }
+
     _rememberWindow(w) {
         if (this.prefSignals.has(w)) return;
         this.prefSignals.set(w, w.connect('unmanaged', () => {
             this.prefSignals.delete(w);
             this.portrait.delete(w);
             this.weight.delete(w);
+            this.landscapeGeom.delete(w);
+            this.baseMax.delete(w);
+            this.widthStep.delete(w);
+            this.widthExtra.delete(w);
+            this.widthBase.delete(w);
         }));
     }
 
     _toggleOrientation(w) {
         this._rememberWindow(w);
+        if (!this._isPortrait(w))
+            this.landscapeGeom.set(w, { max: w.get_maximized(), rect: w.get_frame_rect() });
         this.portrait.set(w, !this._isPortrait(w));
         try { this._normalize(w); } catch (e) { global.logError(`zoomgrid: ${e}`); }
         this._queueRelayout(SETTLE_MS, false);
@@ -579,6 +635,33 @@ class ZoomGrid {
         this._rememberWindow(w);
         if (next === 1) this.weight.delete(w); else this.weight.set(w, next);
         this._relayout();
+    }
+
+    // Allarga/stringe la finestra vera di un passo, attorno al suo centro,
+    // senza uscire dall'area di lavoro; l'altezza resta quella.
+    _changeWidth(w, dir) {
+        const wa = workArea(w.get_monitor());
+        const f = w.get_frame_rect();
+        // passo fisso = 10% della larghezza di partenza: ◂▸ e ▸◂ si annullano
+        this._rememberWindow(w);
+        if (!this.widthStep.has(w)) {
+            this.widthStep.set(w, Math.max(40, Math.round(f.width * WIDTH_STEP)));
+            this.widthBase.set(w, f.width);
+        }
+        const step = this.widthStep.get(w);
+        const nw = Math.max(MIN_WIDTH, Math.min(wa.width, f.width + dir * step));
+        if (nw === f.width) return;
+        // in verticale la larghezza la sceglie la griglia: si ricorda lo scarto
+        if (this._isPortrait(w)) this.widthExtra.set(w, (this.widthExtra.get(w) || 0) + nw - f.width);
+        let x = Math.round(f.x + (f.width - nw) / 2);
+        x = Math.max(wa.x, Math.min(wa.x + wa.width - nw, x));
+        const h = Math.min(f.height, wa.height);
+        const y = Math.max(wa.y, Math.min(wa.y + wa.height - h, f.y));
+        this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
+        if (w.get_maximized()) w.unmaximize(MAX_BOTH);
+        this.baseMax.set(w, 0);
+        w.move_resize_frame(true, x, y, nw, h);
+        // size-changed rifà la griglia
     }
 
     _closeWindow(w) {
@@ -617,7 +700,8 @@ class ZoomGrid {
             items.push({
                 win: w, id: w.get_stable_sequence(), home: w.get_monitor(),
                 fw: f.width, fh: f.height, aspect: f.width / f.height,
-                term: this._isPortrait(w), weight: this._weight(w),
+                term: this._isPortrait(w), userWeight: this._weight(w),
+                weight: this._weight(w) * this._widthBoost(w, f),
             });
         }
         const monitors = Main.layoutManager.monitors.map(mon => mon.index);
@@ -640,15 +724,20 @@ class ZoomGrid {
             const terms = gridItems.filter(it => it.term && it.home === m);
             if (terms.length && gridItems.length > 1) {
                 // proporzione dei terminali che riempie meglio lo spazio
+                // scelta come se ◂▸ / ▸◂ non ci fossero: lo scarto si aggiunge dopo
                 let bestR = null, bestS = -1;
+                const saved = gridItems.map(it => [it.aspect, it.weight]);
+                for (const it of gridItems) it.weight = it.userWeight;
                 for (const r of TERMINAL_RATIOS) {
                     for (const t of terms) t.aspect = r;
                     const sc = computeLayout(gridItems, gridArea, margin);
                     if (sc > bestS + 1) { bestS = sc; bestR = r; }
                 }
+                gridItems.forEach((it, i) => { it.aspect = saved[i][0]; it.weight = saved[i][1]; });
                 this.termRatio.set(m, bestR);
-                const tw = Math.round(area.height * bestR);
                 for (const t of terms) {
+                    const tw = Math.max(MIN_WIDTH, Math.min(area.width,
+                        Math.round(area.height * bestR) + (this.widthExtra.get(t.win) || 0)));
                     const f = t.win.get_frame_rect();
                     if (Math.abs(f.width - tw) > RESIZE_TOLERANCE || Math.abs(f.height - area.height) > RESIZE_TOLERANCE) {
                         if (t.win.get_maximized()) t.win.unmaximize(MAX_BOTH);
@@ -839,7 +928,8 @@ class ZoomGrid {
     }
 
     // Barra di icone a cavallo del bordo alto, a destra; compare passando
-    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ⛶ schermo intero.
+    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ▸◂ ◂▸ larghezza
+    // vera della finestra (anche i terminali verticali), ⛶ schermo intero.
     // (sulla finestra selezionata copre i suoi pulsanti, che la barra rifà)
     _addBar(w, tile, overlay, right, top) {
         const bar = new St.BoxLayout({ style_class: 'zoomgrid-bar', reactive: true, track_hover: true });
@@ -859,6 +949,8 @@ class ZoomGrid {
         add('−', '', () => this._changeWeight(w, -1));
         if (WEIGHT_LABEL[wt]) bar.add_child(new St.Label({ style_class: 'zoomgrid-bar-weight', text: WEIGHT_LABEL[wt] }));
         add('+', '', () => this._changeWeight(w, +1));
+        add('▸◂', '', () => this._changeWidth(w, -1));
+        add('◂▸', '', () => this._changeWidth(w, +1));
         add('⛶', '', () => this.exit(w));
         overlay.add_child(bar);
         const [, bw] = bar.get_preferred_width(-1);
@@ -1101,7 +1193,7 @@ class ZoomGrid {
                     // titolo, Super+Su...) -> schermo intero, esce dalle miniature
                     // (doppio click sulla barra del titolo inoltrato, Super+Su, ...)
                     if (this.active && w === this.activeWin && Date.now() > this.ignoreMaxUntil &&
-                        w.get_maximized() !== (this._isPortrait(w) ? 0 : MAX_BOTH)) {
+                        (w.get_maximized() === MAX_BOTH ? MAX_BOTH : 0) !== (this.baseMax.get(w) || 0)) {
                         this.exit(w);
                         return;
                     }
