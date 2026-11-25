@@ -45,6 +45,8 @@ const FILL_DISTORT = 1.5;       // quanto pesa una casella di forma diversa da q
 const FILL_BALANCE_EXP = 0.35;  // quanto pesa avere miniature di area simile
 const FILL_BLEND = [0, 0.25, 0.5, 0.75, 1]; // righe: da "forma delle finestre" (0) ad "aree uguali" (1)
 const FILL_BALANCE_EXP_WEIGHTED = 1.5; // con − / +: l'area chiesta (×2 = 4 volte) conta più della forma
+const POPUP_MAX_W = 0.4;        // finestra nuova più stretta di così (frazione del monitor)...
+const POPUP_MAX_H = 0.5;        // ...e più bassa di così = popup: resta fuori dalla griglia
 const BAR_HIDE_MS = 80;        // ritardo prima di nascondere la barra (passaggio miniatura -> barra)
 
 const MAX_BOTH = Meta.MaximizeFlags.BOTH;
@@ -443,6 +445,8 @@ class ZoomGrid {
         this.rank = new Map();       // finestra -> posizione scelta con ⇄
         this.solo = null;            // finestra con un monitor tutto per sé (▣), restando in griglia
         this.swapFrom = null;        // ⇄: miniatura che aspetta il secondo click
+        this.popups = new Set();     // finestre nuove piccole (login, estensioni...): sopra la griglia, a grandezza vera
+        this.pending = new Set();    // finestre appena aperte, non ancora classificate
         this.soloMon = null;
         this.seq = [];               // miniature in ordine: monitor da sinistra a destra, poi posizione
         this.baseMax = new Map();    // finestra -> massimizzata sì/no in griglia (per capire se l'utente la massimizza)
@@ -465,16 +469,27 @@ class ZoomGrid {
         Main.keybindingManager.addHotKey('zoomgrid-toggle-all', '<Super><Shift>g', () => this.toggle(true));
         // Programma nuovo aperto (es. dal menu) mentre si è in miniature:
         // diventa la finestra attiva. Dialoghi e popup vengono ignorati.
+        // Finestra nuova: piccola = popup (login, estensioni, avvisi), resta
+        // sopra la griglia a grandezza vera e la griglia non si muove; grande =
+        // entra nella griglia e diventa la finestra attiva. Finché non è
+        // classificata (300 ms) la griglia non la vede.
         this._connect(global.display, 'window-created', (_d, w) => {
             if (!this.active) return;
             this._trackFree(w);
             this._ignoreFocus(1500);
+            this.pending.add(w);
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                this.pending.delete(w);
                 if (this.active && w.get_window_type() === Meta.WindowType.NORMAL &&
                     !w.is_skip_taskbar() && !w.get_transient_for() && w.get_compositor_private())
                 {
-                    this._queueRelayout(SETTLE_MS, true);
-                    this.setActive(w);
+                    if (this._looksPopup(w)) {
+                        this.popups.add(w);
+                        this._queueApplyRegion();
+                    } else {
+                        this._queueRelayout(SETTLE_MS, true);
+                        this.setActive(w);
+                    }
                 }
                 return GLib.SOURCE_REMOVE;
             });
@@ -585,6 +600,8 @@ class ZoomGrid {
         this.activeWin = null;
         this.solo = null;
         this.swapFrom = null;
+        this.popups.clear();
+        this.pending.clear();
         this._cancelClick();
         if (this.relayoutId) { GLib.source_remove(this.relayoutId); this.relayoutId = 0; }
         Main.keybindingManager.removeHotKey('zoomgrid-spread');
@@ -672,6 +689,11 @@ class ZoomGrid {
         }
     }
 
+    _looksPopup(w) {
+        const f = w.get_frame_rect(), wa = workArea(w.get_monitor());
+        return f.width < wa.width * POPUP_MAX_W && f.height < wa.height * POPUP_MAX_H;
+    }
+
     _windows() {
         const ws = global.workspace_manager.get_active_workspace();
         return global.get_window_actors()
@@ -679,6 +701,8 @@ class ZoomGrid {
             .filter(w => w &&
                 w.get_window_type() === Meta.WindowType.NORMAL &&
                 !w.is_skip_taskbar() && !w.minimized &&
+                // dialoghi dichiarati come finestre normali, popup, appena aperte
+                !w.get_transient_for() && !this.popups.has(w) && !this.pending.has(w) &&
                 (w.get_workspace() === ws || w.is_on_all_workspaces()))
             .sort((a, b) => a.get_stable_sequence() - b.get_stable_sequence());
     }
@@ -1123,10 +1147,19 @@ class ZoomGrid {
         const upd = () => this._queueApplyRegion();
         const ids = [
             w.connect('position-changed', upd),
-            w.connect('size-changed', upd),
+            w.connect('size-changed', () => {
+                // popup ingrandito dall'utente: entra nella griglia
+                if (this.popups.has(w) && !this._looksPopup(w)) {
+                    this.popups.delete(w);
+                    if (this.active) this._queueRelayout(SETTLE_MS, true);
+                }
+                upd();
+            }),
             w.connect('notify::minimized', upd),
             w.connect('unmanaged', () => {
                 this.freeSignals.delete(w);
+                this.popups.delete(w);
+                this.pending.delete(w);
                 upd();
             }),
         ];
