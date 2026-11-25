@@ -251,7 +251,7 @@ function fillScore(rects, exp = FILL_BALANCE_EXP) {
 }
 
 // Restituisce false se nessuna disposizione va bene (si usa computeLayout).
-// fixed = true: l'ordine delle miniature l'ha scelto l'utente con ◂ ▸.
+// fixed = true: l'ordine delle miniature l'ha scelto l'utente con ⇄.
 // it.order = posizione nella sequenza (righe: lettura; colonne: per colonna).
 function computeFill(items, area, margin = MARGIN, fixed = false) {
     const W = area.width - 2 * margin, H = area.height - 2 * margin;
@@ -439,9 +439,10 @@ class ZoomGrid {
         this.portrait = new Map();   // finestra -> verticale sì/no scelto con la barra
         this.weight = new Map();     // finestra -> importanza scelta con − / +
         this.landscapeGeom = new Map(); // finestra -> grandezza prima di passare a ▯
-        this.pinMon = new Map();     // finestra -> monitor della miniatura scelto con ◂ ▸
-        this.rank = new Map();       // finestra -> posizione scelta con ◂ ▸
+        this.pinMon = new Map();     // finestra -> monitor della miniatura scelto con ⇄
+        this.rank = new Map();       // finestra -> posizione scelta con ⇄
         this.solo = null;            // finestra con un monitor tutto per sé (▣), restando in griglia
+        this.swapFrom = null;        // ⇄: miniatura che aspetta il secondo click
         this.soloMon = null;
         this.seq = [];               // miniature in ordine: monitor da sinistra a destra, poi posizione
         this.baseMax = new Map();    // finestra -> massimizzata sì/no in griglia (per capire se l'utente la massimizza)
@@ -583,6 +584,7 @@ class ZoomGrid {
         this.active = false;
         this.activeWin = null;
         this.solo = null;
+        this.swapFrom = null;
         this._cancelClick();
         if (this.relayoutId) { GLib.source_remove(this.relayoutId); this.relayoutId = 0; }
         Main.keybindingManager.removeHotKey('zoomgrid-spread');
@@ -627,7 +629,7 @@ class ZoomGrid {
     toggleSpread() {
         if (!this.active) return;
         this.spread = !this.spread;
-        // torna alla disposizione automatica (dimentica ◂ ▸)
+        // torna alla disposizione automatica (dimentica gli scambi ⇄)
         this.pinMon.clear();
         this.rank.clear();
         this._relayout();
@@ -760,28 +762,43 @@ class ZoomGrid {
         this._relayout();
     }
 
-    // ◂ ▸ nella barra: la miniatura scambia il posto con quella prima/dopo.
-    // La sequenza va da sinistra a destra sui monitor: dalla prima posizione
-    // ◂ passa in fondo al monitor a sinistra, dall'ultima ▸ in cima a quello
-    // a destra. Da lì in poi l'ordine e i monitor restano quelli scelti
-    // (Super+Tab torna alla disposizione automatica).
-    _move(w, dir) {
+    // ⇄ nella barra: la miniatura aspetta un secondo click; la miniatura
+    // cliccata dopo (anche su un altro monitor) si scambia di posto con lei.
+    // ⇄ di nuovo o click sullo spazio vuoto = annulla. Da lì in poi l'ordine e
+    // i monitor restano quelli scelti (Super+Tab torna alla disposizione automatica).
+    _startSwap(w) {
+        if (this.swapFrom === w) { this._cancelSwap(); return; }
+        if (this.swapFrom) { this._swapWith(w); return; }
+        this.swapFrom = w;
+        this._relayout();
+        this._showToast('Clicca la miniatura con cui scambiarla');
+    }
+
+    _cancelSwap() {
+        if (!this.swapFrom) return;
+        this.swapFrom = null;
+        if (this.active) this._relayout();
+    }
+
+    _swapWith(w) {
+        const a = this.swapFrom;
+        this.swapFrom = null;
         const seq = this.seq;
-        const i = seq.findIndex(s => s.w === w);
-        const j = i + dir;
-        if (i < 0 || j < 0 || j >= seq.length) return;
-        seq.forEach((s, k) => {
-            this._rememberWindow(s.w);
-            this.rank.set(s.w, k);
-            this.pinMon.set(s.w, s.mon);
-        });
-        const other = seq[j];
-        if (other.mon === seq[i].mon) {
-            this.rank.set(w, j);
-            this.rank.set(other.w, i);
-        } else {
-            this.pinMon.set(w, other.mon);
-            this.rank.set(w, j + (dir > 0 ? -0.5 : 0.5));
+        const sa = seq.find(s => s.w === a), sb = seq.find(s => s.w === w);
+        if (a !== w && sa && sb) {
+            // fissa la disposizione attuale, poi scambia posto e monitor
+            seq.forEach((s, k) => {
+                this._rememberWindow(s.w);
+                this.rank.set(s.w, k);
+                this.pinMon.set(s.w, s.mon);
+            });
+            const ra = this.rank.get(a);
+            this.rank.set(a, this.rank.get(w));
+            this.rank.set(w, ra);
+            this.pinMon.set(a, sb.mon);
+            this.pinMon.set(w, sa.mon);
+            // ▣: la finestra che prende il posto di quella sola non resta sola
+            if (this.solo === a || this.solo === w) this.solo = null;
         }
         this._relayout();
     }
@@ -927,7 +944,9 @@ class ZoomGrid {
                 // quella del momento (altrimenti cambia a ogni ridimensionamento)
                 it.pref = canResize(w) ? this._fillPref(w) : it.aspect;
                 it.aspect = it.pref;
-                const A = f.width * f.height;
+                // area di prima del modo Riempi: non cambia mentre si ridimensiona
+                const o = this._fillOrigOf(w);
+                const A = o.rect.width * o.rect.height;
                 it.fw = Math.sqrt(A * it.pref);
                 it.fh = Math.sqrt(A / it.pref);
             }
@@ -944,7 +963,7 @@ class ZoomGrid {
         if (soloIt) byMon.set(this.soloMon, [soloIt]);
         for (const it of rest) {
             let m = assign ? assign.get(it) : it.home;
-            // monitor scelto con ◂ ▸
+            // monitor scelto con ⇄
             if (this.pinMon.has(it.win) && monitors.includes(this.pinMon.get(it.win))) m = this.pinMon.get(it.win);
             if (!byMon.has(m)) byMon.set(m, []);
             byMon.get(m).push(it);
@@ -952,7 +971,7 @@ class ZoomGrid {
         const seq = [];
         for (const [m, items] of byMon) {
             if (!items.length) continue;
-            // ordine scelto con ◂ ▸ (le finestre nuove in fondo)
+            // ordine scelto con ⇄ (le finestre nuove in fondo)
             const fixed = items.some(it => this.rank.has(it.win));
             if (fixed) {
                 const r = it => this.rank.has(it.win) ? this.rank.get(it.win) : 1e6 + it.id;
@@ -1109,6 +1128,7 @@ class ZoomGrid {
             width: Math.round(fw) + 6, height: Math.round(fh) + 6,
         });
         if (this.selected.includes(w)) tile.add_style_class_name('zoomgrid-selected');
+        if (this.swapFrom === w) tile.add_style_class_name('zoomgrid-swap');
         if (away) tile.add_style_class_name('zoomgrid-away');
         const focused = w === this.activeWin;
         if (focused) tile.add_style_class_name('zoomgrid-focused');
@@ -1118,7 +1138,11 @@ class ZoomGrid {
             if (this._isEcho(event)) return Clutter.EVENT_STOP;
             const btn = event.get_button();
             const ctrl = event.get_state() & Clutter.ModifierType.CONTROL_MASK;
-            if (btn === 1 && ctrl) {
+            if (btn === 1 && this.swapFrom) {
+                // secondo click di ⇄: niente inoltro alla finestra
+                this.swallowRelease = true;
+                this._swapWith(w);
+            } else if (btn === 1 && ctrl) {
                 this._toggleSelect(w);
             } else if (focused) {
                 // finestra selezionata: il click verrà inoltrato al rilascio
@@ -1130,6 +1154,7 @@ class ZoomGrid {
         if (focused) {
             tile.connect('button-release-event', (_a, event) => {
                 if (this._isEcho(event)) return Clutter.EVENT_STOP;
+                if (this.swallowRelease) { this.swallowRelease = false; return Clutter.EVENT_STOP; }
                 if (event.get_state() & Clutter.ModifierType.CONTROL_MASK) return Clutter.EVENT_STOP;
                 const b = event.get_button();
                 if (b !== 1 && b !== 3) return Clutter.EVENT_STOP;   // solo sinistro e destro
@@ -1187,8 +1212,8 @@ class ZoomGrid {
     }
 
     // Barra di icone a cavallo del bordo alto, a destra; compare passando
-    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ◂ ▸ sposta la
-    // miniatura prima/dopo (anche sul monitor accanto), ⛶ schermo intero.
+    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ⇄ scambia di
+    // posto con un'altra miniatura, ▣ monitor intero, ⛶ schermo intero.
     // (sulla finestra selezionata copre i suoi pulsanti, che la barra rifà)
     _addBar(w, tile, overlay, right, top) {
         const bar = new St.BoxLayout({ style_class: 'zoomgrid-bar', reactive: true, track_hover: true });
@@ -1208,8 +1233,7 @@ class ZoomGrid {
         add('−', '', () => this._changeWeight(w, -1));
         if (WEIGHT_LABEL[wt]) bar.add_child(new St.Label({ style_class: 'zoomgrid-bar-weight', text: WEIGHT_LABEL[wt] }));
         add('+', '', () => this._changeWeight(w, +1));
-        add('◂', '', () => this._move(w, -1));
-        add('▸', '', () => this._move(w, +1));
+        add('⇄', this.swapFrom === w ? 'zoomgrid-bar-on' : '', () => this._startSwap(w));
         add('▣', this.solo === w ? 'zoomgrid-bar-on' : '', () => this._toggleSolo(w));
         add('⛶', '', () => this.exit(w));
         overlay.add_child(bar);
@@ -1425,6 +1449,7 @@ class ZoomGrid {
             const b = new St.Widget({ reactive: true, x, y, width, height });
             b.connect('button-press-event', (_a, event) => {
                 if (this._isEcho(event)) return Clutter.EVENT_STOP;
+                if (this.swapFrom) { this._cancelSwap(); return Clutter.EVENT_STOP; }
                 if (this.activeWin) this.setActive(null);
                 return Clutter.EVENT_STOP;
             });
@@ -1467,6 +1492,7 @@ class ZoomGrid {
                     this.winSignals.delete(w);
                     this.fillOrig.delete(w);
                     if (this.solo === w) this.solo = null;
+                    if (this.swapFrom === w) this.swapFrom = null;
                     if (this.wasMinimized) this.wasMinimized.delete(w);
                     if (this.activeWin === w) this.activeWin = null;
                     relayout();

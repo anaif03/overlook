@@ -13,12 +13,12 @@ A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live
 |---|---|
 | Click a thumbnail | Select it (blue border) – keyboard goes to it, clicks and scrolls are forwarded into the window |
 | Double-click a thumbnail, or the ⛶ button | Show that window full screen |
-| Hover a thumbnail | Shows a small bar on its top edge: **✕** close · **▯ / ▭** portrait ↔ landscape · **− / +** less / more important (½, 1, ×2, ×3: the grid gives important windows more space; with two windows ×2 takes about 80%) · **◂ / ▸** swap the thumbnail with the previous / next one; from the last place on a monitor it moves to the next monitor (thumbnails run left to right across monitors; once you move one, the arrangement stays as you set it until `Super+Tab`) · **▣** give this window its whole monitor while staying in the grid (the other thumbnails move to the other monitors; ▣ again to undo) · **⛶** full screen |
+| Hover a thumbnail | Shows a small bar on its top edge: **✕** close · **▯ / ▭** portrait ↔ landscape · **− / +** less / more important (½, 1, ×2, ×3: the grid gives important windows more space; with two windows ×2 takes about 80%) · **⇄** swap places with another thumbnail: click ⇄, then click the other thumbnail (any monitor); ⇄ again or a click on an empty area cancels. Swapped places are kept until `Super+Tab` · **▣** give this window its whole monitor while staying in the grid (the other thumbnails move to the other monitors; ▣ again to undo) · **⛶** full screen |
 | Ctrl+click two thumbnails | Put them side by side |
 | Click an empty area | Deselect |
 | Hot corner (you choose which, see below) | Enter the grid / deselect |
 | `Super+G` | Toggle grid ↔ full screen |
-| `Super+Tab` (in the grid) | Spread thumbnails over all monitors ↔ keep each on its own monitor (also forgets ◂ / ▸ moves) |
+| `Super+Tab` (in the grid) | Spread thumbnails over all monitors ↔ keep each on its own monitor (also forgets ⇄ swaps) |
 | `Super+F` (in the grid) | Fill mode on ↔ off |
 
 New windows join the grid automatically. Minimized windows are left out.
