@@ -963,26 +963,28 @@ class ZoomGrid {
         const rest = soloIt ? items.filter(it => it !== soloIt) : items;
         const assign = this.spread || soloIt ? distribute(rest, monitors) : null;
         const byMon = new Map();
-        if (soloIt) {
-            byMon.set(this.soloMon, [soloIt]);
-            // la finestra vera va su quel monitor: lo riempie senza sgranarsi
-            // (all'uscita torna dov'era, vedi _restoreFill)
-            const sw = soloIt.win;
-            if (sw.get_monitor() !== this.soloMon) {
-                try {
-                    this._fillOrigOf(sw);
-                    this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
-                    sw.move_to_monitor(this.soloMon);
-                    soloIt.home = this.soloMon;
-                } catch (e) { global.logError(`zoomgrid: ${e}`); }
-            }
-        }
+        if (soloIt) byMon.set(this.soloMon, [soloIt]);
         for (const it of rest) {
             let m = assign ? assign.get(it) : it.home;
             // monitor scelto con ⇄
             if (this.pinMon.has(it.win) && monitors.includes(this.pinMon.get(it.win))) m = this.pinMon.get(it.win);
             if (!byMon.has(m)) byMon.set(m, []);
             byMon.get(m).push(it);
+        }
+        // Finestra da sola su un monitor (▣, o rimasta sola in modo Riempi):
+        // la finestra vera va su quel monitor, così lo riempie senza sgranarsi
+        // (all'uscita torna dov'era, vedi _restoreFill).
+        for (const [m, list] of byMon) {
+            if (list.length !== 1 || list[0].home === m) continue;
+            if (!(fill || (soloIt && m === this.soloMon))) continue;
+            const it = list[0], sw = it.win;
+            if (!canResize(sw)) continue;
+            try {
+                this._fillOrigOf(sw);
+                this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
+                sw.move_to_monitor(m);
+                it.home = m;
+            } catch (e) { global.logError(`zoomgrid: ${e}`); }
         }
         const seq = [];
         for (const [m, items] of byMon) {
@@ -1002,7 +1004,8 @@ class ZoomGrid {
 
             const isSolo = soloIt && m === this.soloMon;
             if (fill) {
-                const maxScale = gridItems.length === 1 && !isSolo ? MAX_SCALE : 1;
+                // in modo Riempi anche una finestra da sola riempie il monitor
+                const maxScale = 1;
                 if (!computeFill(gridItems, gridArea, margin, fixed)) computeLayout(gridItems, gridArea, margin, fixed);
                 addSeq();
                 for (const it of gridItems) {
@@ -1439,6 +1442,12 @@ class ZoomGrid {
             });
             ov._monitor = mon.index;
             Main.layoutManager.addChrome(ov, { affectsInputRegion: false, visibleInFullscreen: true });
+            // subito sopra le finestre, sotto pannelli, menu (Start, applet)
+            // e notifiche: altrimenti le miniature, ricreate a ogni ridisegno,
+            // finirebbero sopra il menu e ne prenderebbero i click
+            const parent = ov.get_parent();
+            if (parent && global.window_group.get_parent() === parent)
+                parent.set_child_above_sibling(ov, global.window_group);
             this.overlays.push(ov);
         }
     }
