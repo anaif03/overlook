@@ -11,7 +11,7 @@ A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live
 
 | Action | Effect |
 |---|---|
-| Click a thumbnail | Select it (blue border) – keyboard goes to it, clicks and scrolls are forwarded into the window |
+| Click a thumbnail | Select it: the real window is put exactly in its cell at normal size (blue border, bar always shown), so the mouse works as usual – select text, drag, hover, right-click menus and dialogs. Click an empty area and it becomes a thumbnail again |
 | Double-click a thumbnail, or the ⛶ button | Show that window full screen |
 | Hover a thumbnail | Shows a small bar on its top edge: **✕** close · **▯ / ▭** portrait ↔ landscape · **− / +** less / more important (½, 1, ×2, ×3: the grid gives important windows more space; with two windows ×2 takes about 80%) · **⇄** swap places with another thumbnail: click ⇄, then click the other thumbnail (any monitor); ⇄ again or a click on an empty area cancels. Swapped places are kept until `Super+Tab` · **▣** give this window its whole monitor while staying in the grid (the other thumbnails move to the other monitors; ▣ again to undo). Swapping with ⇄ into the ▣ place gives the whole monitor to the incoming window; its real window moves to that monitor and goes back when you leave the grid · **⛶** full screen |
 | Ctrl+click two thumbnails | Put them side by side |
@@ -50,7 +50,6 @@ Tested on Linux Mint 22.3, Cinnamon 6.6, X11.
 
 ## Known limitations
 
-- Only clicks and scroll are forwarded into thumbnails: no drag, no hover.
 - Context menus and popups open at their real size and position.
 - Desktop icons are not clickable while the grid is active.
 - X11 only (Wayland untested).

@@ -885,6 +885,7 @@ class ZoomGrid {
                     const x = Math.max(wa.x, Math.min(wa.x + wa.width - width, r.x));
                     const y = Math.max(wa.y, Math.min(wa.y + wa.height - height, r.y));
                     w.move_resize_frame(true, x, y, width, height);
+                    w.move_frame(true, x, y);   // vedi _placeReal
                 }
             } catch (e) { global.logError(`zoomgrid: ${e}`); }
         }
@@ -937,11 +938,18 @@ class ZoomGrid {
         for (const w of wins) {
             const f = w.get_frame_rect();
             if (f.width < 1 || f.height < 1) continue;
+            if (fill) this._fillOrigOf(w);
             const it = {
-                win: w, id: w.get_stable_sequence(), home: w.get_monitor(),
+                win: w, id: w.get_stable_sequence(), home: this._homeMon(w),
                 fw: f.width, fh: f.height, aspect: f.width / f.height,
                 term: this._isPortrait(w), weight: this._weight(w),
             };
+            // finestra attiva resa vera: ha la forma della sua casella, ma la
+            // griglia deve continuare a vederla com'era (altrimenti si rincorrono)
+            if (!fill && this.fillOrig.has(w)) {
+                const o = this.fillOrig.get(w);
+                it.fw = o.rect.width; it.fh = o.rect.height; it.aspect = it.fw / it.fh;
+            }
             if (fill) {
                 // la distribuzione sui monitor guarda la forma preferita, non
                 // quella del momento (altrimenti cambia a ogni ridimensionamento)
@@ -975,7 +983,7 @@ class ZoomGrid {
         // la finestra vera va su quel monitor, così lo riempie senza sgranarsi
         // (all'uscita torna dov'era, vedi _restoreFill).
         for (const [m, list] of byMon) {
-            if (list.length !== 1 || list[0].home === m) continue;
+            if (list.length !== 1 || list[0].win.get_monitor() === m || list[0].win === this.activeWin) continue;
             if (!(fill || (soloIt && m === this.soloMon))) continue;
             const it = list[0], sw = it.win;
             if (!canResize(sw)) continue;
@@ -1000,7 +1008,13 @@ class ZoomGrid {
             const gridItems = items, gridArea = area, margin = MARGIN;
             const monX = (Main.layoutManager.monitors[m] || { x: 0 }).x;
             const addSeq = () => { for (const it of gridItems) seq.push({ w: it.win, mon: m, key: [monX, m, it.order || 0] }); };
-            if (overlay) this._addBlockers(overlay, area, null);
+            // spazio vuoto: click = deseleziona; buco sulla finestra attiva (vera)
+            const addBlockers = () => {
+                if (!overlay) return;
+                const act = gridItems.find(it => it.win === this.activeWin);
+                this._addBlockers(overlay, area, act ? act.rect : null);
+            };
+            const away = it => it.win.get_monitor() !== m && it.win !== this.activeWin ? arrowTo(m, it.win.get_monitor()) : null;
 
             const isSolo = soloIt && m === this.soloMon;
             if (fill) {
@@ -1008,17 +1022,19 @@ class ZoomGrid {
                 const maxScale = 1;
                 if (!computeFill(gridItems, gridArea, margin, fixed)) computeLayout(gridItems, gridArea, margin, fixed);
                 addSeq();
+                addBlockers();
                 for (const it of gridItems) {
+                    if (it.win === this.activeWin) continue;   // la fa vera _place
                     try { this._fillResize(it, maxScale); } catch (e) { global.logError(`zoomgrid: ${e}`); }
                 }
                 for (const it of gridItems)
-                    this._place(it, overlay, area, maxScale, it.home !== m ? arrowTo(m, it.home) : null);
+                    this._place(it, overlay, area, maxScale, away(it));
                 continue;
             }
 
             // proporzione dei terminali: solo per quelli che stanno sul loro
             // monitor (il ridimensionamento è vero, avviene sul monitor reale)
-            const terms = gridItems.filter(it => it.term && it.home === m);
+            const terms = gridItems.filter(it => it.term && it.win.get_monitor() === m && it.win !== this.activeWin);
             if (terms.length && gridItems.length > 1) {
                 // proporzione dei terminali che riempie meglio lo spazio
                 let bestR = null, bestS = -1;
@@ -1044,9 +1060,10 @@ class ZoomGrid {
             if (gridItems.length) {
                 computeLayout(gridItems, gridArea, margin, fixed);
                 addSeq();
+                addBlockers();
                 const maxScale = gridItems.length === 1 && !isSolo ? MAX_SCALE : 1;
                 for (const it of gridItems)
-                    this._place(it, overlay, area, maxScale, it.home !== m ? arrowTo(m, it.home) : null);
+                    this._place(it, overlay, area, maxScale, away(it));
             }
         }
         const cmp = (a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.key[2] - b.key[2];
@@ -1117,10 +1134,59 @@ class ZoomGrid {
         upd();
     }
 
+    // Monitor "di casa" di una finestra: dove stava prima che la griglia la
+    // spostasse (finestra attiva resa vera, finestra sola su un monitor).
+    // La distribuzione sui monitor guarda questo, così non cambia a ogni spostamento.
+    _homeMon(w) {
+        const o = this.fillOrig.get(w);
+        if (o) {
+            const i = global.display.get_monitor_index_for_rect(new Meta.Rectangle(o.rect));
+            if (i >= 0) return i;
+        }
+        return w.get_monitor();
+    }
+
+    // Finestra attiva: diventa vera. Niente zoom: la finestra vera va
+    // esattamente nella sua casella, così mouse, trascinamento, selezione del
+    // testo, passaggio del mouse, menu e dialoghi funzionano come sempre.
+    // Attorno solo il bordo (non cliccabile) e la barra sempre visibile.
+    _placeReal(it, overlay, area) {
+        const w = it.win, actor = w.get_compositor_private();
+        if (!actor) return;
+        const x = Math.round(it.rect.x), y = Math.round(it.rect.y);
+        const wd = Math.round(it.rect.w), ht = Math.round(it.rect.h);
+        this._fillOrigOf(w);   // all'uscita torna com'era
+        actor.remove_all_transitions();
+        actor.set_scale(1, 1);
+        actor.set_translation(0, 0, 0);
+        this.scaled.add(w);
+        if (w.is_fullscreen()) w.unmake_fullscreen();
+        const f = w.get_frame_rect();
+        if (Math.abs(f.x - x) > 2 || Math.abs(f.y - y) > 2 ||
+            Math.abs(f.width - wd) > RESIZE_TOLERANCE || Math.abs(f.height - ht) > RESIZE_TOLERANCE ||
+            w.get_maximized()) {
+            this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
+            this.baseMax.set(w, 0);
+            if (w.get_maximized()) w.unmaximize(MAX_BOTH);
+            w.move_resize_frame(true, x, y, wd, ht);
+            // i terminali (passi a caratteri) prendono la grandezza ma
+            // ignorano la posizione: si sposta a parte
+            w.move_frame(true, x, y);
+        }
+        if (!overlay) return;
+        const border = new St.Widget({
+            style_class: 'zoomgrid-tile zoomgrid-focused', reactive: false,
+            x: x - area.x - 3, y: y - area.y - 3, width: wd + 6, height: ht + 6,
+        });
+        overlay.add_child(border);
+        this._addBar(w, border, overlay, x - area.x + wd, y - area.y, true);
+    }
+
     // away = freccia verso il monitor reale, se la miniatura è su un altro monitor
     _place(it, overlay, area, maxScale, away = null) {
         const w = it.win, actor = w.get_compositor_private();
         if (!actor) return;
+        if (w === this.activeWin) { this._placeReal(it, overlay, area); return; }
         const f = w.get_frame_rect(), b = w.get_buffer_rect();
         const s = Math.min(maxScale, it.rect.w / f.width, it.rect.h / f.height);
         const fw = f.width * s, fh = f.height * s;
@@ -1234,7 +1300,8 @@ class ZoomGrid {
     // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ⇄ scambia di
     // posto con un'altra miniatura, ▣ monitor intero, ⛶ schermo intero.
     // (sulla finestra selezionata copre i suoi pulsanti, che la barra rifà)
-    _addBar(w, tile, overlay, right, top) {
+    // always = true: sempre visibile (finestra attiva, che non ha miniatura)
+    _addBar(w, tile, overlay, right, top, always = false) {
         const bar = new St.BoxLayout({ style_class: 'zoomgrid-bar', reactive: true, track_hover: true });
         const add = (label, cls, action) => {
             const b = new St.Button({ style_class: `zoomgrid-bar-btn ${cls}`, label, reactive: true });
@@ -1258,9 +1325,10 @@ class ZoomGrid {
         overlay.add_child(bar);
         const [, bw] = bar.get_preferred_width(-1);
         const [, bh] = bar.get_preferred_height(-1);
-        bar.set_position(right - Math.round(bw) - 8, top - Math.round(bh / 2));
-        bar.hide();
+        bar.set_position(right - Math.round(bw) - 8, Math.max(0, top - Math.round(bh / 2)));
         Main.layoutManager.trackChrome(bar, { affectsInputRegion: true });
+        if (always) return;
+        bar.hide();
 
         // passando dalla miniatura alla barra l'hover cambia per un istante:
         // si decide dopo un attimo
