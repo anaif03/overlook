@@ -797,8 +797,9 @@ class ZoomGrid {
             this.rank.set(w, ra);
             this.pinMon.set(a, sb.mon);
             this.pinMon.set(w, sa.mon);
-            // ▣: la finestra che prende il posto di quella sola non resta sola
-            if (this.solo === a || this.solo === w) this.solo = null;
+            // ▣: chi prende il posto della finestra sola prende anche il monitor intero
+            if (this.solo === a) { this.solo = w; this.soloMon = sa.mon; }
+            else if (this.solo === w) { this.solo = a; this.soloMon = sb.mon; }
         }
         this._relayout();
     }
@@ -861,8 +862,8 @@ class ZoomGrid {
         // size-changed rifà la griglia
     }
 
-    // Rimette le finestre come erano prima del modo Riempi; i terminali
-    // verticali tornano a tutta altezza. skip = finestre da non toccare.
+    // Rimette ogni finestra esattamente com'era prima del modo Riempi
+    // (massimizzata se lo era). skip = finestre da non toccare.
     _restoreFill(skip) {
         const list = [...this.fillOrig];
         this.fillOrig.clear();
@@ -871,9 +872,11 @@ class ZoomGrid {
             if (skip.includes(w)) continue;
             try {
                 if (w.minimized) continue;
-                if (this._isPortrait(w)) { this._normalize(w); continue; }
+                // spostata da ▣: torna sul suo monitor
+                const home = global.display.get_monitor_index_for_rect(new Meta.Rectangle(o.rect));
+                if (home >= 0 && w.get_monitor() !== home) w.move_to_monitor(home);
                 const wa = workArea(w.get_monitor());
-                if (o.max || o.rect.width < o.rect.height) {
+                if (o.max) {
                     if (w.get_maximized() !== MAX_BOTH && w.can_maximize()) w.maximize(MAX_BOTH);
                 } else {
                     if (w.get_maximized()) w.unmaximize(MAX_BOTH);
@@ -960,7 +963,20 @@ class ZoomGrid {
         const rest = soloIt ? items.filter(it => it !== soloIt) : items;
         const assign = this.spread || soloIt ? distribute(rest, monitors) : null;
         const byMon = new Map();
-        if (soloIt) byMon.set(this.soloMon, [soloIt]);
+        if (soloIt) {
+            byMon.set(this.soloMon, [soloIt]);
+            // la finestra vera va su quel monitor: lo riempie senza sgranarsi
+            // (all'uscita torna dov'era, vedi _restoreFill)
+            const sw = soloIt.win;
+            if (sw.get_monitor() !== this.soloMon) {
+                try {
+                    this._fillOrigOf(sw);
+                    this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
+                    sw.move_to_monitor(this.soloMon);
+                    soloIt.home = this.soloMon;
+                } catch (e) { global.logError(`zoomgrid: ${e}`); }
+            }
+        }
         for (const it of rest) {
             let m = assign ? assign.get(it) : it.home;
             // monitor scelto con ⇄
