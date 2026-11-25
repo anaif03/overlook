@@ -1,7 +1,7 @@
 {
   "uuid": "overlook@anaif03",
   "name": "Overlook",
-  "description": "Zoomed-out live grid of all your windows: landscape windows maximized, terminals in portrait. Click to select and use a window in place, double-click or ⛶ for full screen, Ctrl+click two windows to tile them side by side. Bottom-right hot corner or Super+G toggles the grid.",
+  "description": "Zoomed-out live grid of all your windows: windows resized to fill the screen with no wasted space (Super+F), terminals in portrait. Click to select and use a window in place, double-click or ⛶ for full screen, Ctrl+click two windows to tile them side by side. Bottom-right hot corner or Super+G toggles the grid.",
   "url": "https://github.com/anaif03/overlook",
   "cinnamon-version": [
     "6.0",

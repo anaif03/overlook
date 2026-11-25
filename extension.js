@@ -36,15 +36,28 @@ const WEIGHTS = [0.5, 1, 2, 3];  // importanza di una miniatura: − / + nella b
 const BALANCE_EXP = 0.15;       // quanto conta avere miniature di grandezza giusta rispetto all'area totale
 const BALANCE_EXP_WEIGHTED = 0.5; // idem con pesi diversi: ×2 = lato doppio, ½ = lato a metà
 const WEIGHT_LABEL = { 0.5: '½', 2: '×2', 3: '×3' };
-const WIDTH_STEP = 0.1;         // ◂▸ / ▸◂ nella barra: allarga/stringe la finestra vera del 10% della larghezza di partenza
-const MIN_WIDTH = 200;          // px: ▸◂ non stringe sotto questa larghezza
-const BAR_HIDE_MS = 80;         // ritardo prima di nascondere la barra (passaggio miniatura -> barra)
+const MIN_WIDTH = 200;          // px: larghezza minima data a una finestra vera
+const FILL_DEFAULT = true;      // modo Riempi (Super+F): finestre ridimensionate per riempire lo schermo
+const FILL_MIN_ASPECT = 0.3;    // casella più stretta accettata (larghezza/altezza)
+const FILL_MAX_ASPECT = 4;      // casella più larga accettata
+const FILL_MIN_SIDE = 120;      // px: lato minimo di una casella
+const FILL_DISTORT = 1.5;       // quanto pesa una casella di forma diversa da quella della finestra
+const FILL_BALANCE_EXP = 0.35;  // quanto pesa avere miniature di area simile
+const FILL_BLEND = [0, 0.25, 0.5, 0.75, 1]; // righe: da "forma delle finestre" (0) ad "aree uguali" (1)
+const FILL_BALANCE_EXP_WEIGHTED = 1.5; // con − / +: l'area chiesta (×2 = 4 volte) conta più della forma
+const BAR_HIDE_MS = 80;        // ritardo prima di nascondere la barra (passaggio miniatura -> barra)
 
 const MAX_BOTH = Meta.MaximizeFlags.BOTH;
 
 function isTerminal(w) {
     const cls = `${w.get_wm_class() || ''} ${w.get_wm_class_instance() || ''}`;
     return cls.split(' ').some(c => TERMINAL_RE.test(c));
+}
+
+// Le finestre massimizzate dicono allows_resize() = false finché restano
+// massimizzate: si possono comunque smassimizzare e ridimensionare.
+function canResize(w) {
+    return !!w.get_maximized() || (w.allows_resize ? w.allows_resize() : true);
 }
 
 function workArea(monitorIndex) {
@@ -134,10 +147,10 @@ function scoreRects(rects, exp = BALANCE_EXP) {
     return total * Math.pow(lo / hi, exp);
 }
 
-function computeLayout(items, area, margin = MARGIN) {
+function computeLayout(items, area, margin = MARGIN, fixed = false) {
     const W = area.width - 2 * margin, H = area.height - 2 * margin;
     const isP = it => it.aspect < 1;
-    const orders = [
+    const orders = fixed ? [items] : [
         items,
         [...items.filter(it => !isP(it)), ...items.filter(isP)],
         [...items.filter(isP), ...items.filter(it => !isP(it))],
@@ -145,10 +158,10 @@ function computeLayout(items, area, margin = MARGIN) {
     // pesi diversi: anche le più importanti per prime (possono avere una
     // riga/colonna tutta loro) e righe alte in proporzione al peso
     const weighted = items.some(it => (it.weight || 1) !== 1);
-    if (weighted) orders.push([...items].sort((x, y) => (y.weight || 1) - (x.weight || 1)));
+    if (weighted && !fixed) orders.push([...items].sort((x, y) => (y.weight || 1) - (x.weight || 1)));
     const modes = weighted ? [false, true] : [false];
     const exp = weighted ? BALANCE_EXP_WEIGHTED : BALANCE_EXP;
-    let best = null, bestScore = -1;
+    let best = null, bestScore = -1, bestOrder = items;
     for (const order of orders) {
         for (const groups of partitions(order)) {
             for (const wm of modes) {
@@ -156,7 +169,7 @@ function computeLayout(items, area, margin = MARGIN) {
                 const rows = justifiedRows(groups, W, H, it => it.aspect, wm);
                 if (rows) {
                     const s = scoreRects(rows, exp);
-                    if (s > bestScore) { bestScore = s; best = rows; }
+                    if (s > bestScore) { bestScore = s; best = rows; bestOrder = order; }
                 }
                 // colonne (trasposizione)
                 const colsT = justifiedRows(groups, H, W, it => 1 / it.aspect, wm);
@@ -164,16 +177,120 @@ function computeLayout(items, area, margin = MARGIN) {
                     const cols = new Map();
                     for (const [it, r] of colsT) cols.set(it, { x: r.y, y: r.x, w: r.h, h: r.w });
                     const s = scoreRects(cols, exp);
-                    if (s > bestScore) { bestScore = s; best = cols; }
+                    if (s > bestScore) { bestScore = s; best = cols; bestOrder = order; }
                 }
             }
         }
     }
+    bestOrder.forEach((it, i) => { it.order = i; });
     for (const it of items) {
         const r = best.get(it);
         it.rect = { x: area.x + margin + r.x, y: area.y + margin + r.y, w: r.w, h: r.h };
     }
     return bestScore;
+}
+
+// ---------- modo Riempi ----------
+// Le caselle coprono tutta l'area (niente spazio vuoto oltre ai GAP) e ogni
+// finestra vera viene ridimensionata alla forma della sua casella, così la
+// miniatura la riempie. Stesse disposizioni di computeLayout (righe o
+// colonne, ordini, suddivisioni); dentro una riga le larghezze vanno con
+// peso × proporzione preferita, poi tutte le righe si allungano fino a
+// riempire l'altezza. Vince la disposizione che deforma meno le finestre
+// rispetto alla loro forma preferita (it.pref), con miniature simili.
+
+// t = 0: righe alte quanto serve per la forma delle finestre; t = 1: alte in
+// proporzione al numero (e peso) delle loro finestre, così ognuna ha più o
+// meno la stessa area; in mezzo una via di mezzo.
+function fillRows(groups, W, H, a, t = 0) {
+    const avail = H - GAP * (groups.length - 1);
+    if (avail <= 0) return null;
+    const shape = [], areas = [];
+    for (const g of groups) {
+        const rowW = W - GAP * (g.length - 1);
+        if (rowW <= 0) return null;
+        const avgW = g.reduce((s, it) => s + (it.weight || 1), 0) / g.length;
+        shape.push(rowW * avgW / g.reduce((s, it) => s + (it.weight || 1) * a(it), 0));
+        areas.push(g.reduce((s, it) => s + (it.weight || 1) ** 2, 0));
+    }
+    const sS = shape.reduce((s, h) => s + h, 0), sA = areas.reduce((s, h) => s + h, 0);
+    const nat = shape.map((h, i) => Math.pow(h / sS, 1 - t) * Math.pow(areas[i] / sA, t));
+    const k = avail / nat.reduce((s, h) => s + h, 0);
+    const rects = new Map();
+    let y = 0;
+    groups.forEach((g, r) => {
+        const h = nat[r] * k, rowW = W - GAP * (g.length - 1);
+        // larghezze: da "forma" (peso × proporzione) ad "area" (peso²)
+        const u = it => Math.pow((it.weight || 1) * a(it), 1 - t) * Math.pow((it.weight || 1) ** 2, t);
+        const sum = g.reduce((s, it) => s + u(it), 0);
+        let x = 0;
+        for (const it of g) {
+            const w = rowW * u(it) / sum;
+            rects.set(it, { x, y, w, h });
+            x += w + GAP;
+        }
+        y += h + GAP;
+    });
+    return rects;
+}
+
+function fillScore(rects, exp = FILL_BALANCE_EXP) {
+    let cost = 0, tot = 0, lo = Infinity, hi = 0;
+    for (const [it, r] of rects) {
+        if (r.w < FILL_MIN_SIDE || r.h < FILL_MIN_SIDE) return -1;
+        const c = r.w / r.h;
+        if (c < FILL_MIN_ASPECT || c > FILL_MAX_ASPECT) return -1;
+        const wt = it.weight || 1, q = wt * wt, d = Math.log(c / it.pref);
+        cost += q * d * d;
+        tot += q;
+        const norm = r.w * r.h / q;
+        lo = Math.min(lo, norm);
+        hi = Math.max(hi, norm);
+    }
+    return Math.pow(lo / hi, exp) * Math.exp(-FILL_DISTORT * cost / tot);
+}
+
+// Restituisce false se nessuna disposizione va bene (si usa computeLayout).
+// fixed = true: l'ordine delle miniature l'ha scelto l'utente con ◂ ▸.
+// it.order = posizione nella sequenza (righe: lettura; colonne: per colonna).
+function computeFill(items, area, margin = MARGIN, fixed = false) {
+    const W = area.width - 2 * margin, H = area.height - 2 * margin;
+    const isP = it => it.pref < 1;
+    const weighted = items.some(it => (it.weight || 1) !== 1);
+    const exp = weighted ? FILL_BALANCE_EXP_WEIGHTED : FILL_BALANCE_EXP;
+    const orders = fixed ? [items] : [
+        items,
+        [...items.filter(it => !isP(it)), ...items.filter(isP)],
+        [...items.filter(isP), ...items.filter(it => !isP(it))],
+    ];
+    if (weighted && !fixed)
+        orders.push([...items].sort((x, y) => (y.weight || 1) - (x.weight || 1)));
+    let best = null, bestScore = 0, bestOrder = items;
+    for (const order of orders) {
+        for (const groups of partitions(order)) {
+            for (const t of FILL_BLEND) {
+                const rows = fillRows(groups, W, H, it => it.pref, t);
+                if (rows) {
+                    const s = fillScore(rows, exp);
+                    if (s > bestScore) { bestScore = s; best = rows; bestOrder = order; }
+                }
+                const colsT = fillRows(groups, H, W, it => 1 / it.pref, t);
+                if (colsT) {
+                    const cols = new Map();
+                    for (const [it, r] of colsT) cols.set(it, { x: r.y, y: r.x, w: r.h, h: r.w });
+                    const s = fillScore(cols, exp);
+                    if (s > bestScore) { bestScore = s; best = cols; bestOrder = order; }
+                }
+            }
+        }
+    }
+    if (!best) return false;
+    bestOrder.forEach((it, i) => { it.order = i; });
+    for (const it of items) {
+        const r = best.get(it);
+        it.rect = { x: area.x + margin + r.x, y: area.y + margin + r.y, w: r.w, h: r.h };
+    }
+    return true;
 }
 
 // Toglie il rettangolo h da una lista di rettangoli (regione di input).
@@ -322,11 +439,15 @@ class ZoomGrid {
         this.portrait = new Map();   // finestra -> verticale sì/no scelto con la barra
         this.weight = new Map();     // finestra -> importanza scelta con − / +
         this.landscapeGeom = new Map(); // finestra -> grandezza prima di passare a ▯
-        this.widthStep = new Map();  // finestra -> passo di ◂▸ / ▸◂ in px
-        this.widthBase = new Map();  // finestra -> larghezza prima del primo ◂▸ / ▸◂
-        this.widthExtra = new Map(); // finestra verticale -> px in più/meno rispetto alla larghezza scelta dalla griglia
+        this.pinMon = new Map();     // finestra -> monitor della miniatura scelto con ◂ ▸
+        this.rank = new Map();       // finestra -> posizione scelta con ◂ ▸
+        this.solo = null;            // finestra con un monitor tutto per sé (▣), restando in griglia
+        this.soloMon = null;
+        this.seq = [];               // miniature in ordine: monitor da sinistra a destra, poi posizione
         this.baseMax = new Map();    // finestra -> massimizzata sì/no in griglia (per capire se l'utente la massimizza)
         this.prefSignals = new Map(); // 'unmanaged' per dimenticare le due scelte
+        this.fill = FILL_DEFAULT;    // modo Riempi (Super+F)
+        this.fillOrig = new Map();   // finestra -> grandezza prima del modo Riempi (si rimette all'uscita)
     }
 
     enable() {
@@ -380,9 +501,8 @@ class ZoomGrid {
         this.weight.clear();
         this.landscapeGeom.clear();
         this.baseMax.clear();
-        this.widthStep.clear();
-        this.widthExtra.clear();
-        this.widthBase.clear();
+        this.pinMon.clear();
+        this.rank.clear();
     }
 
     // all = true: anche le finestre ridotte a icona.
@@ -405,6 +525,7 @@ class ZoomGrid {
         this.baseMax = new Map();
         if (all) this._restoreMinimized();
         Main.keybindingManager.addHotKey('zoomgrid-spread', '<Super>Tab', () => this.toggleSpread());
+        Main.keybindingManager.addHotKey('zoomgrid-fill', '<Super>f', () => this.toggleFill());
         this._buildOverlays();
         this._queueRelayout(SETTLE_MS, true); // normalizza, aspetta, poi zooma
     }
@@ -461,15 +582,20 @@ class ZoomGrid {
         if (!this.active) return;
         this.active = false;
         this.activeWin = null;
+        this.solo = null;
         this._cancelClick();
         if (this.relayoutId) { GLib.source_remove(this.relayoutId); this.relayoutId = 0; }
         Main.keybindingManager.removeHotKey('zoomgrid-spread');
+        Main.keybindingManager.removeHotKey('zoomgrid-fill');
         this._hideToast();
         this._destroyOverlays();
         this._disconnectWindows();
         const reMin = [...(this.wasMinimized || [])]
             .filter(w => w !== focusWin && !keep.includes(w));
         this.wasMinimized = new Set();
+        // modo Riempi: le finestre tornano della loro grandezza (non quella
+        // che va a schermo intero: la massimizza qui sotto)
+        this._restoreFill(maximize && focusWin ? [focusWin] : []);
         this._reMinimize(reMin);
         for (const w of this.scaled) this._resetActor(w);
         this.scaled.clear();
@@ -501,9 +627,22 @@ class ZoomGrid {
     toggleSpread() {
         if (!this.active) return;
         this.spread = !this.spread;
+        // torna alla disposizione automatica (dimentica ◂ ▸)
+        this.pinMon.clear();
+        this.rank.clear();
         this._relayout();
         this._showToast(this.spread ? 'Miniature distribuite su tutti i monitor'
                                     : 'Miniature sul loro monitor');
+    }
+
+    // Super+F in griglia: modo Riempi <-> finestre della loro grandezza.
+    toggleFill() {
+        if (!this.active) return;
+        this.fill = !this.fill;
+        if (!this.fill) this._restoreFill([]);
+        this._queueRelayout(SETTLE_MS, true);
+        this._showToast(this.fill ? 'Riempi: finestre ridimensionate per riempire lo schermo'
+                                  : 'Finestre della loro grandezza');
     }
 
     _showToast(text) {
@@ -547,11 +686,14 @@ class ZoomGrid {
     _normalize(w) {
         if (w.is_fullscreen()) w.unmake_fullscreen();
         const wa = workArea(w.get_monitor());
-        if (this._isPortrait(w)) {
+        if (this._isPortrait(w) && this.fill && this.active) {
+            // la forma la sceglie il modo Riempi
+            this.baseMax.set(w, 0);
+        } else if (this._isPortrait(w)) {
             this.baseMax.set(w, 0);
             const h = wa.height;
             const wd = Math.max(MIN_WIDTH, Math.min(wa.width,
-                Math.round(h * (this.termRatio.get(w.get_monitor()) || TERMINAL_PORTRAIT)) + (this.widthExtra.get(w) || 0)));
+                Math.round(h * (this.termRatio.get(w.get_monitor()) || TERMINAL_PORTRAIT))));
             if (w.get_maximized()) w.unmaximize(MAX_BOTH);
             const f = w.get_frame_rect();
             if (Math.abs(f.width - wd) > RESIZE_TOLERANCE || Math.abs(f.height - h) > RESIZE_TOLERANCE)
@@ -586,25 +728,6 @@ class ZoomGrid {
         return this.weight.get(w) || 1;
     }
 
-    // Allargata con ◂▸ la miniatura deve restare alta uguale: più area in
-    // proporzione alla larghezza (il peso conta sul lato, quindi radice).
-    // Nei terminali verticali conta solo lo scarto dato a mano, non la
-    // larghezza scelta dalla griglia (altrimenti si rincorrono).
-    _widthBoost(w, f) {
-        let k;
-        if (this._isPortrait(w)) {
-            const extra = this.widthExtra.get(w) || 0;
-            const auto = f.width - extra;
-            if (!extra || auto <= 0) return 1;
-            k = Math.sqrt(f.width / auto);
-        } else {
-            const base = this.widthBase.get(w);
-            if (!base) return 1;
-            k = Math.sqrt(f.width / base);
-        }
-        return Math.abs(k - 1) < 0.02 ? 1 : k;
-    }
-
     _rememberWindow(w) {
         if (this.prefSignals.has(w)) return;
         this.prefSignals.set(w, w.connect('unmanaged', () => {
@@ -613,9 +736,9 @@ class ZoomGrid {
             this.weight.delete(w);
             this.landscapeGeom.delete(w);
             this.baseMax.delete(w);
-            this.widthStep.delete(w);
-            this.widthExtra.delete(w);
-            this.widthBase.delete(w);
+            this.pinMon.delete(w);
+            this.rank.delete(w);
+            this.fillOrig.delete(w);
         }));
     }
 
@@ -637,31 +760,127 @@ class ZoomGrid {
         this._relayout();
     }
 
-    // Allarga/stringe la finestra vera di un passo, attorno al suo centro,
-    // senza uscire dall'area di lavoro; l'altezza resta quella.
-    _changeWidth(w, dir) {
-        const wa = workArea(w.get_monitor());
-        const f = w.get_frame_rect();
-        // passo fisso = 10% della larghezza di partenza: ◂▸ e ▸◂ si annullano
-        this._rememberWindow(w);
-        if (!this.widthStep.has(w)) {
-            this.widthStep.set(w, Math.max(40, Math.round(f.width * WIDTH_STEP)));
-            this.widthBase.set(w, f.width);
+    // ◂ ▸ nella barra: la miniatura scambia il posto con quella prima/dopo.
+    // La sequenza va da sinistra a destra sui monitor: dalla prima posizione
+    // ◂ passa in fondo al monitor a sinistra, dall'ultima ▸ in cima a quello
+    // a destra. Da lì in poi l'ordine e i monitor restano quelli scelti
+    // (Super+Tab torna alla disposizione automatica).
+    _move(w, dir) {
+        const seq = this.seq;
+        const i = seq.findIndex(s => s.w === w);
+        const j = i + dir;
+        if (i < 0 || j < 0 || j >= seq.length) return;
+        seq.forEach((s, k) => {
+            this._rememberWindow(s.w);
+            this.rank.set(s.w, k);
+            this.pinMon.set(s.w, s.mon);
+        });
+        const other = seq[j];
+        if (other.mon === seq[i].mon) {
+            this.rank.set(w, j);
+            this.rank.set(other.w, i);
+        } else {
+            this.pinMon.set(w, other.mon);
+            this.rank.set(w, j + (dir > 0 ? -0.5 : 0.5));
         }
-        const step = this.widthStep.get(w);
-        const nw = Math.max(MIN_WIDTH, Math.min(wa.width, f.width + dir * step));
-        if (nw === f.width) return;
-        // in verticale la larghezza la sceglie la griglia: si ricorda lo scarto
-        if (this._isPortrait(w)) this.widthExtra.set(w, (this.widthExtra.get(w) || 0) + nw - f.width);
-        let x = Math.round(f.x + (f.width - nw) / 2);
-        x = Math.max(wa.x, Math.min(wa.x + wa.width - nw, x));
-        const h = Math.min(f.height, wa.height);
-        const y = Math.max(wa.y, Math.min(wa.y + wa.height - h, f.y));
+        this._relayout();
+    }
+
+    // ---------- modo Riempi: finestre vere ----------
+
+    // Grandezza da rimettere all'uscita: presa la prima volta che il modo
+    // Riempi vede la finestra.
+    _fillOrigOf(w) {
+        if (!this.fillOrig.has(w)) {
+            const f = w.get_frame_rect();
+            this.fillOrig.set(w, {
+                rect: { x: f.x, y: f.y, width: f.width, height: f.height },
+                max: w.get_maximized() === MAX_BOTH,
+            });
+        }
+        return this.fillOrig.get(w);
+    }
+
+    // Forma preferita (larghezza/altezza): verticale per i terminali, la sua
+    // per le altre (quella dello schermo se era massimizzata).
+    _fillPref(w) {
+        const o = this._fillOrigOf(w);
+        const wa = workArea(w.get_monitor());
+        let p;
+        if (this._isPortrait(w)) p = TERMINAL_PORTRAIT;
+        else if (o.max) p = wa.width / wa.height;
+        else p = o.rect.width / o.rect.height;
+        // messa orizzontale con ▭ ma era stretta: forma dello schermo
+        if (!this._isPortrait(w) && p < 1) p = wa.width / wa.height;
+        return p;
+    }
+
+    // Ridimensiona la finestra vera alla forma della sua casella: stessa area
+    // di prima (dentro l'area di lavoro), ma mai più piccola della casella,
+    // così la miniatura non viene ingrandita oltre la grandezza vera.
+    _fillResize(it, maxScale) {
+        const w = it.win;
+        if (!canResize(w)) return;
+        const o = this._fillOrigOf(w);
+        const wa = workArea(w.get_monitor());
+        const c = it.rect.w / it.rect.h;
+        const A = Math.min(o.max ? wa.width * wa.height : o.rect.width * o.rect.height, wa.width * wa.height);
+        let tw = Math.sqrt(A * c), th = Math.sqrt(A / c);
+        const minW = Math.max(MIN_WIDTH, it.rect.w / maxScale);
+        if (tw < minW) { tw = minW; th = tw / c; }
+        if (tw > wa.width) { tw = wa.width; th = tw / c; }
+        if (th > wa.height) { th = wa.height; tw = th * c; }
+        tw = Math.round(tw); th = Math.round(th);
+        const f = w.get_frame_rect();
+        if (Math.abs(f.width - tw) <= RESIZE_TOLERANCE && Math.abs(f.height - th) <= RESIZE_TOLERANCE &&
+            !w.get_maximized()) return;
+        let x = Math.round(f.x + (f.width - tw) / 2), y = Math.round(f.y + (f.height - th) / 2);
+        x = Math.max(wa.x, Math.min(wa.x + wa.width - tw, x));
+        y = Math.max(wa.y, Math.min(wa.y + wa.height - th, y));
         this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
-        if (w.get_maximized()) w.unmaximize(MAX_BOTH);
         this.baseMax.set(w, 0);
-        w.move_resize_frame(true, x, y, nw, h);
+        if (w.get_maximized()) w.unmaximize(MAX_BOTH);
+        w.move_resize_frame(true, x, y, tw, th);
         // size-changed rifà la griglia
+    }
+
+    // Rimette le finestre come erano prima del modo Riempi; i terminali
+    // verticali tornano a tutta altezza. skip = finestre da non toccare.
+    _restoreFill(skip) {
+        const list = [...this.fillOrig];
+        this.fillOrig.clear();
+        this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
+        for (const [w, o] of list) {
+            if (skip.includes(w)) continue;
+            try {
+                if (w.minimized) continue;
+                if (this._isPortrait(w)) { this._normalize(w); continue; }
+                const wa = workArea(w.get_monitor());
+                if (o.max || o.rect.width < o.rect.height) {
+                    if (w.get_maximized() !== MAX_BOTH && w.can_maximize()) w.maximize(MAX_BOTH);
+                } else {
+                    if (w.get_maximized()) w.unmaximize(MAX_BOTH);
+                    const r = o.rect;
+                    const width = Math.min(r.width, wa.width), height = Math.min(r.height, wa.height);
+                    const x = Math.max(wa.x, Math.min(wa.x + wa.width - width, r.x));
+                    const y = Math.max(wa.y, Math.min(wa.y + wa.height - height, r.y));
+                    w.move_resize_frame(true, x, y, width, height);
+                }
+            } catch (e) { global.logError(`zoomgrid: ${e}`); }
+        }
+    }
+
+    // ▣ nella barra: la finestra prende tutto il monitor dove si trova
+    // davvero (così non cambia forma in modo strano), le altre vanno sugli
+    // altri monitor; si resta in griglia. Di nuovo ▣ = torna.
+    _toggleSolo(w) {
+        if (this.solo === w) {
+            this.solo = null;
+        } else {
+            this.solo = w;
+            this.soloMon = w.get_monitor();
+        }
+        this._relayout();
     }
 
     _closeWindow(w) {
@@ -693,51 +912,88 @@ class ZoomGrid {
         this._trackWindows(wins);
         this._buildOverlays();
 
+        const fill = this.fill;
         const items = [];
         for (const w of wins) {
             const f = w.get_frame_rect();
             if (f.width < 1 || f.height < 1) continue;
-            items.push({
+            const it = {
                 win: w, id: w.get_stable_sequence(), home: w.get_monitor(),
                 fw: f.width, fh: f.height, aspect: f.width / f.height,
-                term: this._isPortrait(w), userWeight: this._weight(w),
-                weight: this._weight(w) * this._widthBoost(w, f),
-            });
+                term: this._isPortrait(w), weight: this._weight(w),
+            };
+            if (fill) {
+                // la distribuzione sui monitor guarda la forma preferita, non
+                // quella del momento (altrimenti cambia a ogni ridimensionamento)
+                it.pref = canResize(w) ? this._fillPref(w) : it.aspect;
+                it.aspect = it.pref;
+                const A = f.width * f.height;
+                it.fw = Math.sqrt(A * it.pref);
+                it.fh = Math.sqrt(A / it.pref);
+            }
+            items.push(it);
         }
-        const monitors = Main.layoutManager.monitors.map(mon => mon.index);
-        const assign = this.spread ? distribute(items, monitors) : null;
+        const allMons = Main.layoutManager.monitors.map(mon => mon.index);
+        // ▣: un monitor tutto per una finestra, le altre sugli altri
+        const soloIt = this.solo && allMons.length > 1 && allMons.includes(this.soloMon)
+            ? items.find(it => it.win === this.solo) : null;
+        const monitors = soloIt ? allMons.filter(m => m !== this.soloMon) : allMons;
+        const rest = soloIt ? items.filter(it => it !== soloIt) : items;
+        const assign = this.spread || soloIt ? distribute(rest, monitors) : null;
         const byMon = new Map();
-        for (const it of items) {
-            const m = assign ? assign.get(it) : it.home;
+        if (soloIt) byMon.set(this.soloMon, [soloIt]);
+        for (const it of rest) {
+            let m = assign ? assign.get(it) : it.home;
+            // monitor scelto con ◂ ▸
+            if (this.pinMon.has(it.win) && monitors.includes(this.pinMon.get(it.win))) m = this.pinMon.get(it.win);
             if (!byMon.has(m)) byMon.set(m, []);
             byMon.get(m).push(it);
         }
+        const seq = [];
         for (const [m, items] of byMon) {
             if (!items.length) continue;
+            // ordine scelto con ◂ ▸ (le finestre nuove in fondo)
+            const fixed = items.some(it => this.rank.has(it.win));
+            if (fixed) {
+                const r = it => this.rank.has(it.win) ? this.rank.get(it.win) : 1e6 + it.id;
+                items.sort((a, b) => r(a) - r(b));
+            }
             const area = workArea(m);
             const overlay = this.overlays.find(o => o._monitor === m);
             const gridItems = items, gridArea = area, margin = MARGIN;
+            const monX = (Main.layoutManager.monitors[m] || { x: 0 }).x;
+            const addSeq = () => { for (const it of gridItems) seq.push({ w: it.win, mon: m, key: [monX, m, it.order || 0] }); };
             if (overlay) this._addBlockers(overlay, area, null);
+
+            const isSolo = soloIt && m === this.soloMon;
+            if (fill) {
+                const maxScale = gridItems.length === 1 && !isSolo ? MAX_SCALE : 1;
+                if (!computeFill(gridItems, gridArea, margin, fixed)) computeLayout(gridItems, gridArea, margin, fixed);
+                addSeq();
+                for (const it of gridItems) {
+                    try { this._fillResize(it, maxScale); } catch (e) { global.logError(`zoomgrid: ${e}`); }
+                }
+                for (const it of gridItems)
+                    this._place(it, overlay, area, maxScale, it.home !== m ? arrowTo(m, it.home) : null);
+                continue;
+            }
 
             // proporzione dei terminali: solo per quelli che stanno sul loro
             // monitor (il ridimensionamento è vero, avviene sul monitor reale)
             const terms = gridItems.filter(it => it.term && it.home === m);
             if (terms.length && gridItems.length > 1) {
                 // proporzione dei terminali che riempie meglio lo spazio
-                // scelta come se ◂▸ / ▸◂ non ci fossero: lo scarto si aggiunge dopo
                 let bestR = null, bestS = -1;
-                const saved = gridItems.map(it => [it.aspect, it.weight]);
-                for (const it of gridItems) it.weight = it.userWeight;
+                const saved = gridItems.map(it => it.aspect);
                 for (const r of TERMINAL_RATIOS) {
                     for (const t of terms) t.aspect = r;
-                    const sc = computeLayout(gridItems, gridArea, margin);
+                    const sc = computeLayout(gridItems, gridArea, margin, fixed);
                     if (sc > bestS + 1) { bestS = sc; bestR = r; }
                 }
-                gridItems.forEach((it, i) => { it.aspect = saved[i][0]; it.weight = saved[i][1]; });
+                gridItems.forEach((it, i) => { it.aspect = saved[i]; });
                 this.termRatio.set(m, bestR);
                 for (const t of terms) {
-                    const tw = Math.max(MIN_WIDTH, Math.min(area.width,
-                        Math.round(area.height * bestR) + (this.widthExtra.get(t.win) || 0)));
+                    const tw = Math.max(MIN_WIDTH, Math.min(area.width, Math.round(area.height * bestR)));
                     const f = t.win.get_frame_rect();
                     if (Math.abs(f.width - tw) > RESIZE_TOLERANCE || Math.abs(f.height - area.height) > RESIZE_TOLERANCE) {
                         if (t.win.get_maximized()) t.win.unmaximize(MAX_BOTH);
@@ -748,12 +1004,15 @@ class ZoomGrid {
                 }
             }
             if (gridItems.length) {
-                computeLayout(gridItems, gridArea, margin);
-                const maxScale = gridItems.length === 1 ? MAX_SCALE : 1;
+                computeLayout(gridItems, gridArea, margin, fixed);
+                addSeq();
+                const maxScale = gridItems.length === 1 && !isSolo ? MAX_SCALE : 1;
                 for (const it of gridItems)
                     this._place(it, overlay, area, maxScale, it.home !== m ? arrowTo(m, it.home) : null);
             }
         }
+        const cmp = (a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.key[2] - b.key[2];
+        this.seq = seq.sort(cmp);
         // gli angoli attivi di Cinnamon devono restare sopra gli overlay
         this._raiseHotCorners();
         for (const a of global.get_window_actors()) this._trackFree(a.get_meta_window());
@@ -928,8 +1187,8 @@ class ZoomGrid {
     }
 
     // Barra di icone a cavallo del bordo alto, a destra; compare passando
-    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ▸◂ ◂▸ larghezza
-    // vera della finestra (anche i terminali verticali), ⛶ schermo intero.
+    // sopra la miniatura: ✕ chiudi, ▯/▭ forma, − + importanza, ◂ ▸ sposta la
+    // miniatura prima/dopo (anche sul monitor accanto), ⛶ schermo intero.
     // (sulla finestra selezionata copre i suoi pulsanti, che la barra rifà)
     _addBar(w, tile, overlay, right, top) {
         const bar = new St.BoxLayout({ style_class: 'zoomgrid-bar', reactive: true, track_hover: true });
@@ -949,8 +1208,9 @@ class ZoomGrid {
         add('−', '', () => this._changeWeight(w, -1));
         if (WEIGHT_LABEL[wt]) bar.add_child(new St.Label({ style_class: 'zoomgrid-bar-weight', text: WEIGHT_LABEL[wt] }));
         add('+', '', () => this._changeWeight(w, +1));
-        add('▸◂', '', () => this._changeWidth(w, -1));
-        add('◂▸', '', () => this._changeWidth(w, +1));
+        add('◂', '', () => this._move(w, -1));
+        add('▸', '', () => this._move(w, +1));
+        add('▣', this.solo === w ? 'zoomgrid-bar-on' : '', () => this._toggleSolo(w));
         add('⛶', '', () => this.exit(w));
         overlay.add_child(bar);
         const [, bw] = bar.get_preferred_width(-1);
@@ -1205,6 +1465,8 @@ class ZoomGrid {
                     this._ignoreFocus(800);
                     this.scaled.delete(w);
                     this.winSignals.delete(w);
+                    this.fillOrig.delete(w);
+                    if (this.solo === w) this.solo = null;
                     if (this.wasMinimized) this.wasMinimized.delete(w);
                     if (this.activeWin === w) this.activeWin = null;
                     relayout();
