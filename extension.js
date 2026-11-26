@@ -496,6 +496,7 @@ class ZoomGrid {
         });
         this._connect(global.workspace_manager, 'active-workspace-changed', () => this.exit(null));
         this._connect(global.display, 'notify::focus-window', () => this._onFocus());
+        this._connect(global.stage, 'captured-event', (_a, e) => this._onCaptured(e));
         this._connect(Main.layoutManager, 'monitors-changed', () => {
             if (this.active) this._queueRelayout(SETTLE_MS, false);
         });
@@ -1105,6 +1106,10 @@ class ZoomGrid {
     // intoccabile (e, se modale, blocca anche la sua finestra).
 
     _freeRects() {
+        return this._freeWins().map(w => w.get_frame_rect());
+    }
+
+    _freeWins() {
         if (!this.active) return [];
         const ws = global.workspace_manager.get_active_workspace();
         const T = Meta.WindowType;
@@ -1116,9 +1121,39 @@ class ZoomGrid {
             if (t === T.DESKTOP || t === T.DOCK) continue;
             if (!w.is_override_redirect() && w.get_workspace() !== ws && !w.is_on_all_workspaces()) continue;
             const f = w.get_frame_rect();
-            if (f.width > 0 && f.height > 0) out.push(f);
+            if (f.width > 0 && f.height > 0) out.push(w);
         }
         return out;
+    }
+
+    // Click su un dialogo/popup senza focus: Cinnamon lo intercetta per dare
+    // il focus e lo consegna all'elemento grafico più in alto, cioè alle
+    // nostre miniature (che stanno sopra tutte le finestre). Lo rubiamo qui
+    // e lo inoltriamo al dialogo, così funziona già al primo click.
+    _onCaptured(event) {
+        if (!this.active) return Clutter.EVENT_PROPAGATE;
+        const type = event.type();
+        if (type === Clutter.EventType.BUTTON_RELEASE && Date.now() < (this.freeSwallowUntil || 0)) {
+            this.freeSwallowUntil = 0;
+            return Clutter.EVENT_STOP;
+        }
+        if (type !== Clutter.EventType.BUTTON_PRESS || this.fwdRunning || this._isEcho(event))
+            return Clutter.EVENT_PROPAGATE;
+        // solo click finiti sui nostri overlay (non pannelli, menu, ...)
+        let a = event.get_source();
+        while (a && !this.overlays.includes(a)) a = a.get_parent();
+        if (!a) return Clutter.EVENT_PROPAGATE;
+        const [x, y] = event.get_coords();
+        const inside = w => {
+            const f = w.get_frame_rect();
+            return x >= f.x && x < f.x + f.width && y >= f.y && y < f.y + f.height;
+        };
+        const hits = global.display.sort_windows_by_stacking(this._freeWins()).filter(inside);
+        if (!hits.length) return Clutter.EVENT_PROPAGATE;
+        const w = hits[hits.length - 1];
+        this.freeSwallowUntil = Date.now() + 3000;   // il rilascio vero va ignorato
+        this._forward(w, x, y, x, y, [event.get_button()]);
+        return Clutter.EVENT_STOP;
     }
 
     // Applica la regione di input di Cinnamon meno le finestre libere
@@ -1221,7 +1256,10 @@ class ZoomGrid {
         if (!actor) return;
         if (w === this.activeWin) { this._placeReal(it, overlay, area); return; }
         const f = w.get_frame_rect(), b = w.get_buffer_rect();
-        const s = Math.min(maxScale, it.rect.w / f.width, it.rect.h / f.height);
+        // mai scala esattamente 1: una finestra solo spostata Cinnamon la
+        // crede al suo posto vero e, se lì è coperta, smette di disegnarla
+        // (miniatura nera)
+        const s = Math.min(maxScale, it.rect.w / f.width, it.rect.h / f.height, 0.999);
         const fw = f.width * s, fh = f.height * s;
         const X = it.rect.x + (it.rect.w - fw) / 2;
         const Y = it.rect.y + (it.rect.h - fh) / 2;
@@ -1645,7 +1683,8 @@ class ZoomGrid {
         const w = global.display.focus_window;
         if (this.activeWin && Date.now() < (this.forwardingUntil || 0)) {
             // un evento inoltrato è finito sulla finestra sbagliata: rimetti il focus
-            if (w && w !== this.activeWin) this.activeWin.activate(global.get_current_time());
+            if (w && w !== this.activeWin && this.scaled.has(w))
+                this.activeWin.activate(global.get_current_time());
             return;
         }
         if (w && w !== this.activeWin && this.scaled.has(w)) this.setActive(w);
