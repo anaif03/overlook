@@ -24,6 +24,9 @@ const ANIM_MS = 220;            // durata animazione zoom
 const MAX_SCALE = 0.8;          // zoom massimo se c'è una sola finestra sul monitor
 const TERMINAL_RATIOS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]; // proporzioni verticali provate per i terminali
 const DOUBLE_CLICK_MS = 280;
+const LOOP_MAX = 6;            // ricalcoli causati da cambi delle finestre...
+const LOOP_WINDOW_MS = 5000;   // ...in questo tempo = loop
+const LOOP_PAUSE_MS = 10000;   // e per tanto smettiamo di inseguirle
 const FWD_DELAY_MS = 25;        // attesa perché Cinnamon applichi il "buco" di input    // finestra per riconoscere il doppio click
 const RESIZE_TOLERANCE = 24;    // px: i terminali arrotondano alla griglia dei caratteri
 const SETTLE_MS = 450;          // attesa dopo maximize/resize prima di zoomare
@@ -456,6 +459,7 @@ class ZoomGrid {
     }
 
     enable() {
+        this._sweepOrphans();
         // Memorizza la regione di input che Cinnamon imposta, per poterci
         // "bucare" un solo pixel durante l'inoltro dei click/rotellina.
         this._origSetRegion = global.set_stage_input_region;
@@ -848,7 +852,10 @@ class ZoomGrid {
     // per le altre (quella dello schermo se era massimizzata).
     _fillPref(w) {
         const o = this._fillOrigOf(w);
-        const wa = workArea(w.get_monitor());
+        // monitor di casa (dove stava prima della griglia), non quello del
+        // momento: se la griglia la sposta, la forma non deve cambiare
+        // (altrimenti cambia la distribuzione, la griglia la risposta... loop)
+        const wa = workArea(this._homeMon(w));
         let p;
         if (this._isPortrait(w)) p = TERMINAL_PORTRAIT;
         else if (o.max) p = wa.width / wa.height;
@@ -865,9 +872,13 @@ class ZoomGrid {
         const w = it.win;
         if (!canResize(w)) return;
         const o = this._fillOrigOf(w);
-        const wa = workArea(w.get_monitor());
+        // la finestra vera sta sul suo monitor di casa (fisso: non dipende da
+        // dove si trova adesso), o su quello dove è rimasta da sola
+        const target = it.target !== undefined ? it.target : this._homeMon(w);
+        const wa = workArea(target);
+        const home = workArea(this._homeMon(w));
         const c = it.rect.w / it.rect.h;
-        const A = Math.min(o.max ? wa.width * wa.height : o.rect.width * o.rect.height, wa.width * wa.height);
+        const A = Math.min(o.max ? home.width * home.height : o.rect.width * o.rect.height, wa.width * wa.height);
         let tw = Math.sqrt(A * c), th = Math.sqrt(A / c);
         const minW = Math.max(MIN_WIDTH, it.rect.w / maxScale);
         if (tw < minW) { tw = minW; th = tw / c; }
@@ -875,8 +886,9 @@ class ZoomGrid {
         if (th > wa.height) { th = wa.height; tw = th * c; }
         tw = Math.round(tw); th = Math.round(th);
         const f = w.get_frame_rect();
+        const cur = global.display.get_monitor_index_for_rect(f);
         if (Math.abs(f.width - tw) <= RESIZE_TOLERANCE && Math.abs(f.height - th) <= RESIZE_TOLERANCE &&
-            !w.get_maximized()) return;
+            !w.get_maximized() && cur === target) return;
         let x = Math.round(f.x + (f.width - tw) / 2), y = Math.round(f.y + (f.height - th) / 2);
         x = Math.max(wa.x, Math.min(wa.x + wa.width - tw, x));
         y = Math.max(wa.y, Math.min(wa.y + wa.height - th, y));
@@ -884,6 +896,8 @@ class ZoomGrid {
         this.baseMax.set(w, 0);
         if (w.get_maximized()) w.unmaximize(MAX_BOTH);
         w.move_resize_frame(true, x, y, tw, th);
+        // i terminali ignorano la posizione in move_resize_frame
+        if (cur !== target) w.move_frame(true, x, y);
         // size-changed rifà la griglia
     }
 
@@ -1008,10 +1022,12 @@ class ZoomGrid {
         // la finestra vera va su quel monitor, così lo riempie senza sgranarsi
         // (all'uscita torna dov'era, vedi _restoreFill).
         for (const [m, list] of byMon) {
-            if (list.length !== 1 || list[0].win.get_monitor() === m || list[0].win === this.activeWin) continue;
+            if (list.length !== 1 || list[0].win === this.activeWin) continue;
             if (!(fill || (soloIt && m === this.soloMon))) continue;
             const it = list[0], sw = it.win;
             if (!canResize(sw)) continue;
+            it.target = m;   // anche se è già lì: _fillResize non la deve riportare a casa
+            if (sw.get_monitor() === m) continue;
             try {
                 this._fillOrigOf(sw);
                 this.ignoreMaxUntil = Math.max(this.ignoreMaxUntil, Date.now() + 1500);
@@ -1094,6 +1110,13 @@ class ZoomGrid {
         const cmp = (a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.key[2] - b.key[2];
         this.seq = seq.sort(cmp);
         // gli angoli attivi di Cinnamon devono restare sopra gli overlay
+        // le barre sopra tutte le miniature: una finestra vera più grande
+        // della sua casella porta la barra sopra la miniatura vicina, che
+        // altrimenti si prende i click (⛶ & co. non rispondevano)
+        for (const ov of this.overlays)
+            for (const c of ov.get_children())
+                if (c.has_style_class_name && c.has_style_class_name('zoomgrid-bar'))
+                    ov.set_child_above_sibling(c, null);
         this._raiseHotCorners();
         for (const a of global.get_window_actors()) this._trackFree(a.get_meta_window());
         this._applyRegion();
@@ -1624,10 +1647,23 @@ class ZoomGrid {
 
     _destroyOverlays() {
         for (const ov of this.overlays) {
-            Main.layoutManager.removeChrome(ov);
-            ov.destroy();
+            // un errore su uno non deve lasciare gli altri sullo schermo
+            try { Main.layoutManager.removeChrome(ov); } catch (e) { global.logError(`overlook: ${e}`); }
+            try { ov.destroy(); } catch (e) {}
         }
         this.overlays = [];
+        this._sweepOrphans();
+    }
+
+    // Overlay rimasti da un'istanza precedente o da un errore: restano sopra
+    // le finestre e si prendono i click anche a griglia spenta. Si tolgono.
+    _sweepOrphans() {
+        for (const c of Main.uiGroup.get_children()) {
+            if (this.overlays.includes(c) || !c.has_style_class_name ||
+                !c.has_style_class_name('zoomgrid-overlay')) continue;
+            try { Main.layoutManager.removeChrome(c); } catch (e) {}
+            try { c.destroy(); } catch (e) {}
+        }
     }
 
     // ---------- tracking finestre ----------
@@ -1635,7 +1671,25 @@ class ZoomGrid {
     _trackWindows(wins) {
         for (const w of wins) {
             if (this.winSignals.has(w)) continue;
-            const relayout = () => { if (this.active) this._queueRelayout(SETTLE_MS, false); };
+            const relayout = () => {
+                if (!this.active) return;
+                // freno anti-loop: troppi ricalcoli causati da finestre che
+                // cambiano forma/posizione = griglia e finestre si rincorrono
+                const now = Date.now();
+                if (now < (this.loopPauseUntil || 0)) return;
+                this.geoHits = (this.geoHits || []).filter(t => now - t < LOOP_WINDOW_MS);
+                // più segnali vicini = un solo ricalcolo: si conta una volta
+                const last = this.geoHits[this.geoHits.length - 1] || 0;
+                if (now - last > SETTLE_MS) this.geoHits.push(now);
+                if (this.geoHits.length > LOOP_MAX) {
+                    this.geoHits = [];
+                    this.loopPauseUntil = now + LOOP_PAUSE_MS;
+                    const f = w.get_frame_rect();
+                    global.log(`overlook: loop fermato (ultima: "${w.get_title()}" ${f.x},${f.y} ${f.width}x${f.height} mon${w.get_monitor()})`);
+                    return;
+                }
+                this._queueRelayout(SETTLE_MS, false);
+            };
             const ids = [
                 w.connect('size-changed', () => {
                     // la finestra attiva massimizzata dall'utente (doppio click sul
