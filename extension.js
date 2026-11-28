@@ -694,9 +694,14 @@ class ZoomGrid {
         }
     }
 
+    // Popup = finestra piccola di un programma che ha già finestre in griglia
+    // (login/estensioni del browser...). Piccola ma di un programma nuovo
+    // (es. Office tool) = finestra vera: entra in griglia.
     _looksPopup(w) {
         const f = w.get_frame_rect(), wa = workArea(w.get_monitor());
-        return f.width < wa.width * POPUP_MAX_W && f.height < wa.height * POPUP_MAX_H;
+        if (!(f.width < wa.width * POPUP_MAX_W && f.height < wa.height * POPUP_MAX_H)) return false;
+        const cls = w.get_wm_class();
+        return !!cls && this._windows().some(o => o !== w && o.get_wm_class() === cls);
     }
 
     _windows() {
