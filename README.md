@@ -21,7 +21,7 @@ A permanent "zoomed-out desktop" for Cinnamon: every window is shown as a **live
 | `Super+Tab` (in the grid) | Spread thumbnails over all monitors ↔ keep each on its own monitor (also forgets ⇄ swaps) |
 | `Super+F` (in the grid) | Fill mode on ↔ off |
 
-New windows join the grid automatically and become the selected window. A small new window (narrower than 40% and lower than 50% of the monitor: login windows, extension popups, notices) is treated as a popup: it stays above the grid at its real size and the grid does not move; if you make it bigger it joins the grid. Dialogs that belong to another window stay out of the grid. Minimized windows are left out.
+New windows join the grid automatically and become the selected window. A small new window (narrower than 40% and lower than 50% of the monitor) from an app that already has windows in the grid (login windows, extension popups, notices) is treated as a popup: it stays above the grid at its real size and the grid does not move; if you make it bigger it joins the grid. A small window of an app that is not in the grid yet (for example a tool's window) joins the grid normally. Dialogs that belong to another window stay out of the grid. Minimized windows are left out.
 
 ## Install
 
