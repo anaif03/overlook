@@ -24,6 +24,7 @@ const ANIM_MS = 220;            // durata animazione zoom
 const MAX_SCALE = 0.8;          // zoom massimo se c'è una sola finestra sul monitor
 const TERMINAL_RATIOS = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]; // proporzioni verticali provate per i terminali
 const DOUBLE_CLICK_MS = 280;
+const AWAY_MAX_SCALE = 1.6;   // ingrandimento massimo di una miniatura fuori dal suo monitor
 const LOOP_MAX = 6;            // ricalcoli causati da cambi delle finestre...
 const LOOP_WINDOW_MS = 5000;   // ...in questo tempo = loop
 const LOOP_PAUSE_MS = 10000;   // e per tanto smettiamo di inseguirle
@@ -448,6 +449,7 @@ class ZoomGrid {
         this.rank = new Map();       // finestra -> posizione scelta con ⇄
         this.solo = null;            // finestra con un monitor tutto per sé (▣), restando in griglia
         this.swapFrom = null;        // ⇄: miniatura che aspetta il secondo click
+        this.cells = null;          // dopo ⇄: caselle ferme (finestra -> {mon, rect, order})
         this.popups = new Set();     // finestre nuove piccole (login, estensioni...): sopra la griglia, a grandezza vera
         this.pending = new Set();    // finestre appena aperte, non ancora classificate
         this.soloMon = null;
@@ -502,6 +504,7 @@ class ZoomGrid {
         this._connect(global.display, 'notify::focus-window', () => this._onFocus());
         this._connect(global.stage, 'captured-event', (_a, e) => this._onCaptured(e));
         this._connect(Main.layoutManager, 'monitors-changed', () => {
+            this.cells = null;
             if (this.active) this._queueRelayout(SETTLE_MS, false);
         });
     }
@@ -600,6 +603,7 @@ class ZoomGrid {
     // keep = finestre da lasciare aperte anche se erano ridotte a icona
     // maximize = false: la finestra scelta resta della sua grandezza
     exit(focusWin, keep = [], maximize = true) {
+        this.cells = null;
         if (!this.active) return;
         this.active = false;
         this.activeWin = null;
@@ -649,6 +653,7 @@ class ZoomGrid {
 
     // Super+Tab in griglia: distribuite su tutti i monitor <-> ognuna sul suo.
     toggleSpread() {
+        this.cells = null;
         if (!this.active) return;
         this.spread = !this.spread;
         // torna alla disposizione automatica (dimentica gli scambi ⇄)
@@ -661,6 +666,7 @@ class ZoomGrid {
 
     // Super+F in griglia: modo Riempi <-> finestre della loro grandezza.
     toggleFill() {
+        this.cells = null;
         if (!this.active) return;
         this.fill = !this.fill;
         if (!this.fill) this._restoreFill([]);
@@ -779,6 +785,7 @@ class ZoomGrid {
     }
 
     _toggleOrientation(w) {
+        this.cells = null;
         this._rememberWindow(w);
         if (!this._isPortrait(w))
             this.landscapeGeom.set(w, { max: w.get_maximized(), rect: w.get_frame_rect() });
@@ -788,6 +795,7 @@ class ZoomGrid {
     }
 
     _changeWeight(w, step) {
+        this.cells = null;
         const i = WEIGHTS.indexOf(this._weight(w));
         const next = WEIGHTS[Math.max(0, Math.min(WEIGHTS.length - 1, i + step))];
         if (next === this._weight(w)) return;
@@ -834,6 +842,10 @@ class ZoomGrid {
             // ▣: chi prende il posto della finestra sola prende anche il monitor intero
             if (this.solo === a) { this.solo = w; this.soloMon = sa.mon; }
             else if (this.solo === w) { this.solo = a; this.soloMon = sb.mon; }
+            // solo le due finestre cambiano casella, le altre restano ferme
+            this.cells = new Map(seq.map(s => [s.w, { mon: s.mon, rect: { ...s.rect }, order: s.order }]));
+            this.cells.set(a, { mon: sb.mon, rect: { ...sb.rect }, order: sb.order });
+            this.cells.set(w, { mon: sa.mon, rect: { ...sa.rect }, order: sa.order });
         }
         this._relayout();
     }
@@ -939,6 +951,7 @@ class ZoomGrid {
     // davvero (così non cambia forma in modo strano), le altre vanno sugli
     // altri monitor; si resta in griglia. Di nuovo ▣ = torna.
     _toggleSolo(w) {
+        this.cells = null;
         if (this.solo === w) {
             this.solo = null;
         } else {
@@ -967,6 +980,9 @@ class ZoomGrid {
     }
 
     _relayout() {
+        // a griglia chiusa non si ricostruisce niente (gli overlay
+        // resterebbero sullo schermo a prendersi i click)
+        if (!this.active) return;
         const wins = this._windows();
         if (this.activeWin && !wins.includes(this.activeWin)) this.activeWin = null;
         // ripristina le finestre che non fanno più parte della griglia
@@ -1023,6 +1039,19 @@ class ZoomGrid {
             if (!byMon.has(m)) byMon.set(m, []);
             byMon.get(m).push(it);
         }
+        // Dopo uno scambio ⇄ le caselle restano quelle di prima (solo le due
+        // finestre si scambiano il posto). Se cambiano le finestre, si ricalcola.
+        const frozen = this.cells && this.cells.size === items.length &&
+            items.every(it => this.cells.has(it.win));
+        if (this.cells && !frozen) this.cells = null;
+        if (frozen) {
+            byMon.clear();
+            for (const it of items) {
+                const c = this.cells.get(it.win);
+                if (!byMon.has(c.mon)) byMon.set(c.mon, []);
+                byMon.get(c.mon).push(it);
+            }
+        }
         // Finestra da sola su un monitor (▣, o rimasta sola in modo Riempi):
         // la finestra vera va su quel monitor, così lo riempie senza sgranarsi
         // (all'uscita torna dov'era, vedi _restoreFill).
@@ -1053,7 +1082,7 @@ class ZoomGrid {
             const overlay = this.overlays.find(o => o._monitor === m);
             const gridItems = items, gridArea = area, margin = MARGIN;
             const monX = (Main.layoutManager.monitors[m] || { x: 0 }).x;
-            const addSeq = () => { for (const it of gridItems) seq.push({ w: it.win, mon: m, key: [monX, m, it.order || 0] }); };
+            const addSeq = () => { for (const it of gridItems) seq.push({ w: it.win, mon: m, key: [monX, m, it.order || 0], rect: { ...it.rect }, order: it.order || 0 }); };
             // spazio vuoto: click = deseleziona; buco sulla finestra attiva (vera)
             const addBlockers = () => {
                 if (!overlay) return;
@@ -1061,8 +1090,31 @@ class ZoomGrid {
                 this._addBlockers(overlay, area, act ? act.rect : null);
             };
             const away = it => it.win.get_monitor() !== m && it.win !== this.activeWin ? arrowTo(m, it.win.get_monitor()) : null;
+            // miniatura su un altro monitor: la finestra vera non può crescere
+            // oltre il suo monitor, quindi la miniatura può ingrandirsi un po'
+            // (meglio un po' sgranata che un buco)
+            const awayScale = (it, ms) => it.win.get_monitor() !== m && it.win !== this.activeWin ? Math.max(ms, AWAY_MAX_SCALE) : ms;
 
             const isSolo = soloIt && m === this.soloMon;
+            if (frozen) {
+                for (const it of gridItems) {
+                    const c = this.cells.get(it.win);
+                    it.rect = { ...c.rect };
+                    it.order = c.order;
+                }
+                const maxScale = fill || isSolo || gridItems.length > 1 ? 1 : MAX_SCALE;
+                addSeq();
+                addBlockers();
+                if (fill) {
+                    for (const it of gridItems) {
+                        if (it.win === this.activeWin) continue;
+                        try { this._fillResize(it, maxScale); } catch (e) { global.logError(`zoomgrid: ${e}`); }
+                    }
+                }
+                for (const it of gridItems)
+                    this._place(it, overlay, area, awayScale(it, maxScale), away(it));
+                continue;
+            }
             if (fill) {
                 // in modo Riempi anche una finestra da sola riempie il monitor
                 const maxScale = 1;
@@ -1074,7 +1126,7 @@ class ZoomGrid {
                     try { this._fillResize(it, maxScale); } catch (e) { global.logError(`zoomgrid: ${e}`); }
                 }
                 for (const it of gridItems)
-                    this._place(it, overlay, area, maxScale, away(it));
+                    this._place(it, overlay, area, awayScale(it, maxScale), away(it));
                 continue;
             }
 
@@ -1287,7 +1339,8 @@ class ZoomGrid {
         // mai scala esattamente 1: una finestra solo spostata Cinnamon la
         // crede al suo posto vero e, se lì è coperta, smette di disegnarla
         // (miniatura nera)
-        const s = Math.min(maxScale, it.rect.w / f.width, it.rect.h / f.height, 0.999);
+        let s = Math.min(maxScale, it.rect.w / f.width, it.rect.h / f.height);
+        if (Math.abs(s - 1) < 0.001) s = 0.999;
         const fw = f.width * s, fh = f.height * s;
         const X = it.rect.x + (it.rect.w - fw) / 2;
         const Y = it.rect.y + (it.rect.h - fh) / 2;
